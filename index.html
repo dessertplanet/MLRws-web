@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MLRws Sample Manager</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: monospace; font-size: 14px; padding: 20px; max-width: 900px; margin: 0 auto; }
+h1 { margin-bottom: 10px; }
+#status { margin: 10px 0; padding: 8px; border: 1px solid #ccc; }
+.track { border: 1px solid #ccc; margin: 8px 0; padding: 10px; }
+.track.drag-over { border-color: #1f6feb; background: rgba(31,111,235,0.06); }
+.track-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.track-header label { font-weight: bold; min-width: 60px; }
+.track-header select { font-family: monospace; }
+.track-info { font-size: 12px; color: #666; margin-bottom: 6px; }
+.track-drop-hint { font-size: 11px; color: #888; margin-left: auto; }
+.track-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.track-actions button { font-family: monospace; font-size: 12px; padding: 4px 10px; cursor: pointer; }
+.track-actions button.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+.waveform-container { position: relative; margin: 8px 0; height: 80px; border: 1px solid #ddd; cursor: crosshair; }
+.waveform-container canvas { width: 100%; height: 100%; }
+.crop-handle { position: absolute; top: 0; width: 2px; height: 100%; background: red; cursor: ew-resize; }
+.crop-region { position: absolute; top: 0; height: 100%; background: rgba(0,0,255,0.1); pointer-events: none; }
+.playhead { position: absolute; top: 0; width: 2px; height: 100%; background: #00cc00; pointer-events: none; display: none; }
+#connect-btn { font-family: monospace; font-size: 14px; padding: 6px 16px; cursor: pointer; margin-bottom: 10px; }
+.progress { height: 4px; background: #eee; margin-top: 4px; }
+.progress-bar { height: 100%; background: #333; width: 0%; transition: width 0.1s; }
+</style>
+</head>
+<body>
+<h1>MLRws Sample Manager</h1>
+<button id="connect-btn">Connect</button>
+<div id="status">Not connected</div>
+<div id="tracks"></div>
+
+<script src="MLRws.js"></script>
+</body>
+</html>

@@ -108,7 +108,7 @@ function adpcmEncode(samples16) {
   return { adpcmBytes: adpcmBytes.slice(0, Math.ceil(nSamples / 2)), keyframes, sampleCount: nSamples };
 }
 
-function buildTrackBlob(encoded, recordSpeedShift = 0, recordedChannel = 0) {
+function buildTrackBlob(encoded, recordSpeedShift = 0, recordedChannel = 0, cv1PitchEnabled = true) {
   const { adpcmBytes, keyframes, sampleCount } = encoded;
   const headerBuf = new ArrayBuffer(MLR_HEADER_SIZE);
   const hdr = new DataView(headerBuf);
@@ -120,7 +120,9 @@ function buildTrackBlob(encoded, recordSpeedShift = 0, recordedChannel = 0) {
   hdr.setUint32(8, adpcmBytes.length, true);
   hdr.setUint32(12, keyframes.length, true);
   hdr.setInt8(16, recordSpeedShift);
-  hdr.setUint8(17, recordedChannel & 0x01); hdr.setUint8(18, 0); hdr.setUint8(19, 0);
+  hdr.setUint8(17, recordedChannel & 0x01);
+  hdr.setUint8(18, 0);
+  hdr.setUint8(19, cv1PitchEnabled ? 0 : 1);
 
   for (let i = 0; i < keyframes.length && i < MLR_MAX_KEYFRAMES; i++) {
     const off = MLR_KEYFRAME_OFFSET + i * 4;
@@ -243,7 +245,13 @@ function isSerialConnected() {
 
 function updateConnectButton() {
   const btn = document.getElementById('connect-btn');
-  if (btn) btn.textContent = isSerialConnected() ? 'Disconnect' : 'Connect';
+  const connected = isSerialConnected();
+  if (btn) btn.textContent = connected ? 'Disconnect' : 'Connect';
+
+  for (let t = 0; t < MLR_NUM_TRACKS; t++) {
+    const cvSel = document.getElementById(`cv1pitch-${t}`);
+    if (cvSel) cvSel.disabled = !connected;
+  }
 }
 
 function getPortInfo(serialPort) {
@@ -353,7 +361,7 @@ function clearDeviceVisualsAndBuffers() {
       st.cropStart = 0;
       st.cropEnd = 0;
       st.recordSpeedShift = 0;
-      st.gain = 1.0;
+      st.cv1PitchEnabled = true;
     }
 
     const info = document.getElementById(`info-${t}`);
@@ -362,13 +370,11 @@ function clearDeviceVisualsAndBuffers() {
     const pbar = document.getElementById(`pbar-${t}`);
     if (pbar) pbar.style.width = '0%';
 
-    const gain = document.getElementById(`gain-${t}`);
-    const gainVal = document.getElementById(`gain-val-${t}`);
-    if (gain) gain.value = 0;
-    if (gainVal) gainVal.textContent = '0 dB';
-
     const fileInput = document.getElementById(`file-${t}`);
     if (fileInput) fileInput.value = '';
+
+    const cvSel = document.getElementById(`cv1pitch-${t}`);
+    if (cvSel) cvSel.checked = true;
 
     const ph = document.getElementById(`playhead-${t}`);
     if (ph) ph.style.display = 'none';
@@ -681,6 +687,7 @@ async function cmdInfo(options = {}) {
       numKeyframes: parseInt(parts[3], 10),
       recordSpeedShift: parts.length > 4 ? parseInt(parts[4], 10) : 0,
       recordedChannel: parts.length > 5 ? (parseInt(parts[5], 10) & 0x01) : null,
+      cv1PitchEnabled: parts.length > 6 ? (parseInt(parts[6], 10) !== 0) : true,
     });
   }
 
@@ -697,6 +704,36 @@ async function cmdErase(track) {
   await serialWrite(new Uint8Array([0x45, track])); // 'E' + track
   const resp = await waitForLine();
   if (resp !== 'OK') throw new Error('Erase failed: ' + resp);
+}
+
+async function cmdSetCv1Pitch(track, enabled) {
+  await cmdSync();
+  await serialWrite(new Uint8Array([0x50, track, enabled ? 1 : 0])); // 'P' + track + enabled
+  const resp = await waitForLine();
+  if (resp !== 'OK') throw new Error('CV1 pitch update failed: ' + resp);
+}
+
+async function syncCv1PitchSetting(track, enabled) {
+  let lastError = null;
+  setStatus('Syncing metadata...');
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await cmdSetCv1Pitch(track, enabled);
+      await refreshInfo({ quietErrors: true });
+      setStatus('Metadata synced successfully');
+      return;
+    } catch (err) {
+      lastError = err;
+      console.warn(`CV1 pitch metadata sync attempt ${attempt + 1}/5 failed:`, err);
+      readBuffer = new Uint8Array(0);
+      if (attempt < 4) {
+        await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+      }
+    }
+  }
+
+  throw lastError || new Error('Metadata sync failed');
 }
 
 async function cmdWrite(track, blob, progressCb) {
@@ -855,9 +892,9 @@ function createTrackUI() {
       cropStart: 0,
       cropEnd: 0,
       speedIdx: 3, // normal
-      gain: 1.0,   // linear gain applied before upload/preview
       recordSpeedShift: 0,
       recordedChannel: 0,
+      cv1PitchEnabled: true,
     };
 
     const div = document.createElement('div');
@@ -872,15 +909,13 @@ function createTrackUI() {
         <select id="speed-${t}">
           ${SPEEDS.map((s, i) => `<option value="${i}" ${i === 3 ? 'selected' : ''}>${s.name} (${maxSecs(s)}s)</option>`).join('')}
         </select>
-        <label style="font-size:11px;margin-left:8px">Channel:</label>
+        <label class="control-label">Channel:</label>
         <select id="channel-${t}">
           <option value="0" ${trackState[t].recordedChannel === 0 ? 'selected' : ''}>1</option>
           <option value="1" ${trackState[t].recordedChannel === 1 ? 'selected' : ''}>2</option>
         </select>
-        <span class="track-drop-hint">drop audio file here</span>
-        <label style="font-size:11px;margin-left:8px">Gain:</label>
-        <input type="range" id="gain-${t}" min="-12" max="12" value="0" step="1" style="width:80px;vertical-align:middle">
-        <span id="gain-val-${t}" style="font-size:11px;min-width:40px;display:inline-block">0 dB</span>
+        <label class="control-label">CV1 pitch:</label>
+        <input type="checkbox" id="cv1pitch-${t}" ${trackState[t].cv1PitchEnabled ? 'checked' : ''}>
         <span id="info-${t}" class="track-info">empty</span>
       </div>
       <div class="waveform-container" id="wave-container-${t}">
@@ -933,13 +968,18 @@ function createTrackUI() {
       if (previewState[t]) previewTrack(t, true);
     });
 
-    // Gain slider
-    document.getElementById(`gain-${t}`).addEventListener('input', (e) => {
-      const dB = parseInt(e.target.value);
-      trackState[t].gain = Math.pow(10, dB / 20);
-      document.getElementById(`gain-val-${t}`).textContent = `${dB >= 0 ? '+' : ''}${dB} dB`;
-      drawWaveform(t);
-      if (previewState[t]) previewTrack(t, true);
+    document.getElementById(`cv1pitch-${t}`).addEventListener('change', async (e) => {
+      const enabled = !!e.target.checked;
+      trackState[t].cv1PitchEnabled = enabled;
+      if (port) {
+        try {
+          await syncCv1PitchSetting(t, enabled);
+        } catch (err) {
+          e.target.checked = !enabled;
+          trackState[t].cv1PitchEnabled = !enabled;
+          setStatus('CV1 pitch update error: ' + err.message);
+        }
+      }
     });
 
     // Set up crop interaction once (handlers check for audioBuffer)
@@ -1222,7 +1262,6 @@ function drawWaveform(t) {
 
   const data = getSelectedChannelData(st);
   const len = data.length;
-  const gain = st.gain || 1.0;
 
   // Draw waveform (always full width, no zoom)
   ctx.fillStyle = '#f8f8f8';
@@ -1235,7 +1274,7 @@ function drawWaveform(t) {
     const end = Math.floor((x + 1) * samplesPerPixel);
     let min = 1, max = -1;
     for (let i = start; i < end && i < len; i++) {
-      const s = data[i] * gain;
+      const s = data[i];
       if (s < min) min = s;
       if (s > max) max = s;
     }
@@ -1243,17 +1282,6 @@ function drawWaveform(t) {
     const y1 = ((1 - Math.min(1, max)) / 2) * h;
     const y2 = ((1 - Math.max(-1, min)) / 2) * h;
     ctx.fillRect(x, y1, 1, y2 - y1);
-  }
-
-  // Draw clipping line at 0 dBFS
-  if (gain > 1.0) {
-    ctx.strokeStyle = 'rgba(255,0,0,0.2)';
-    ctx.lineWidth = 1;
-    const clipLevel = 1.0 / gain;
-    const yTop = ((1 - clipLevel) / 2) * h;
-    const yBot = ((1 + clipLevel) / 2) * h;
-    ctx.beginPath(); ctx.moveTo(0, yTop); ctx.lineTo(w, yTop); ctx.stroke();
-    ctx.beginPath(); ctx.moveTo(0, yBot); ctx.lineTo(w, yBot); ctx.stroke();
   }
 
   // Draw crop region
@@ -1376,7 +1404,7 @@ function cropToSelection(t) {
   setStatus(`Cropped to ${newBuf.duration.toFixed(2)}s`);
 }
 
-function prepareTrackUpload(sourceBuffer, sourceChannel, speed, cropStart, cropEnd, gain, recordedChannel) {
+function prepareTrackUpload(sourceBuffer, sourceChannel, speed, cropStart, cropEnd, recordedChannel, cv1PitchEnabled) {
   const targetRate = recTargetRate(speed);
   const srcData = sourceBuffer.getChannelData(sourceChannel);
   const cropped = srcData.slice(cropStart, cropEnd);
@@ -1387,23 +1415,23 @@ function prepareTrackUpload(sourceBuffer, sourceChannel, speed, cropStart, cropE
   });
   croppedBuf.getChannelData(0).set(cropped);
 
-  const samples16 = resampleBuffer(croppedBuf, targetRate, gain || 1.0);
+  const samples16 = resampleBuffer(croppedBuf, targetRate, 1.0);
   const maxSamples = getMaxSamples();
   if (samples16.length > maxSamples) {
     throw new Error(`too many samples (${samples16.length} > ${maxSamples})`);
   }
 
   const encoded = adpcmEncode(samples16);
-  const blob = buildTrackBlob(encoded, speed.shift, recordedChannel);
+  const blob = buildTrackBlob(encoded, speed.shift, recordedChannel, cv1PitchEnabled);
   if (blob.length > MLR_TRACK_FLASH_SIZE) {
     throw new Error(`data too large (${blob.length} > ${MLR_TRACK_FLASH_SIZE})`);
   }
 
-  return { blob, encoded, speed, recordedChannel };
+  return { blob, encoded, speed, recordedChannel, cv1PitchEnabled };
 }
 
 async function writePreparedTrack(t, prepared) {
-  const { blob, encoded, speed, recordedChannel } = prepared;
+  const { blob, encoded, speed, recordedChannel, cv1PitchEnabled } = prepared;
   setStatus(`Uploading track ${t + 1} (${blob.length} bytes)...`);
   const pbar = document.getElementById(`pbar-${t}`);
   await cmdWrite(t, blob, (pct) => { pbar.style.width = (pct * 100) + '%'; });
@@ -1424,18 +1452,17 @@ async function writePreparedTrack(t, prepared) {
     st.speedIdx = speedShiftToIdx(decoded.recordSpeedShift);
     st.recordSpeedShift = decoded.recordSpeedShift;
     st.recordedChannel = decoded.recordedChannel;
+    st.cv1PitchEnabled = decoded.cv1PitchEnabled;
     document.getElementById(`speed-${t}`).value = st.speedIdx;
     document.getElementById(`channel-${t}`).value = st.recordedChannel;
-    st.gain = 1.0;
-    document.getElementById(`gain-${t}`).value = 0;
-    document.getElementById(`gain-val-${t}`).textContent = '0 dB';
+    document.getElementById(`cv1pitch-${t}`).checked = st.cv1PitchEnabled;
     updateCropForSpeed(t);
     drawWaveform(t);
   }
 
   const dur = (encoded.sampleCount / (48000 * speed.ratio)).toFixed(2);
   document.getElementById(`info-${t}`).textContent =
-    `${encoded.sampleCount} samples (${(encoded.sampleCount / 48000).toFixed(2)}s at 1x), ${encoded.adpcmBytes.length} bytes, rec ${speedShiftToLabel(speed.shift)}, ch ${recordedChannel + 1}`;
+    `${encoded.sampleCount} samples (${(encoded.sampleCount / 48000).toFixed(2)}s at 1x), ${encoded.adpcmBytes.length} bytes, rec ${speedShiftToLabel(speed.shift)}, ch ${recordedChannel + 1}, cv1 ${cv1PitchEnabled ? 'on' : 'off'}`;
   setTimeout(() => { pbar.style.width = '0%'; }, 2000);
   return { dur, encoded };
 }
@@ -1446,7 +1473,6 @@ async function uploadTrack(t) {
   if (!port) { setStatus('Not connected'); return; }
 
   const speed = SPEEDS[st.speedIdx];
-  const gain = st.gain || 1.0;
   const cropStart = st.cropStart;
   const cropEnd = st.cropEnd;
 
@@ -1456,7 +1482,7 @@ async function uploadTrack(t) {
     // channel for either output channel.
     const sourceChannel = getSourceChannelIndex(st);
     const recordedChannel = getRecordedChannel(t);
-    const prepared = prepareTrackUpload(st.audioBuffer, sourceChannel, speed, cropStart, cropEnd, gain, recordedChannel);
+    const prepared = prepareTrackUpload(st.audioBuffer, sourceChannel, speed, cropStart, cropEnd, recordedChannel, st.cv1PitchEnabled !== false);
     const result = await writePreparedTrack(t, prepared);
 
     // Refresh compact device metadata without blocking the UI.
@@ -1539,8 +1565,10 @@ async function eraseTrack(t) {
     trackState[t].cropStart = 0;
     trackState[t].cropEnd = 0;
     trackState[t].transients = [];
+    trackState[t].cv1PitchEnabled = true;
     drawWaveform(t);
     document.getElementById(`info-${t}`).textContent = 'empty';
+    document.getElementById(`cv1pitch-${t}`).checked = true;
     setStatus(`Track ${t + 1} cleared`);
   } catch (e) {
     setStatus('Erase error: ' + e.message);
@@ -1604,7 +1632,7 @@ function previewTrack(t, forceRestart = false) {
     numberOfChannels: 1
   });
   croppedBuf.getChannelData(0).set(cropped);
-  const samples16 = resampleBuffer(croppedBuf, targetRate, st.gain || 1.0);
+  const samples16 = resampleBuffer(croppedBuf, targetRate, 1.0);
   const enc = adpcmEncode(samples16);
 
   let pred = 0, si = 0;
@@ -1670,6 +1698,7 @@ function previewTrack(t, forceRestart = false) {
 }
 
 async function refreshInfo(options = {}) {
+  const { quietErrors = false } = options;
   if (!port) return;
   try {
     const tracks = await cmdInfo(options);
@@ -1677,21 +1706,25 @@ async function refreshInfo(options = {}) {
       const el = document.getElementById(`info-${t.index}`);
       if (trackState[t.index] && t.recordedChannel !== null) {
         trackState[t.index].recordedChannel = t.recordedChannel;
+        trackState[t.index].cv1PitchEnabled = t.cv1PitchEnabled !== false;
         const chSel = document.getElementById(`channel-${t.index}`);
+        const cvSel = document.getElementById(`cv1pitch-${t.index}`);
         if (chSel) chSel.value = t.recordedChannel;
+        if (cvSel) cvSel.checked = trackState[t.index].cv1PitchEnabled;
       }
       if (t.sampleCount > 0) {
         const dur = (t.sampleCount / 48000).toFixed(2);
         const spd = speedShiftToLabel(t.recordSpeedShift);
         const ch = trackState[t.index] ? getRecordedChannel(t.index) : (t.recordedChannel || 0);
-        el.textContent = `${t.sampleCount} samples (${dur}s at 1x), ${t.adpcmBytes} bytes, rec ${spd}, ch ${ch + 1}`;
+        const cv1 = t.cv1PitchEnabled === false ? 'off' : 'on';
+        el.textContent = `${t.sampleCount} samples (${dur}s at 1x), ${t.adpcmBytes} bytes, rec ${spd}, ch ${ch + 1}, cv1 ${cv1}`;
       } else {
         el.textContent = 'empty';
       }
     }
     return tracks;
   } catch (e) {
-    setStatus('Info error: ' + e.message);
+    if (!quietErrors) setStatus('Info error: ' + e.message);
     throw e;
   }
 }
@@ -1706,6 +1739,7 @@ function decodeTrackBlob(data) {
   const adpcmBytes = dv.getUint32(8, true);
   const recordSpeedShift = dv.getInt8(16);
   const recordedChannel = dv.getUint8(17) & 0x01;
+  const cv1PitchEnabled = dv.getUint8(19) !== 1;
   if (sampleCount === 0) return null;
 
   const adpcmData = data.slice(MLR_HEADER_SIZE, MLR_HEADER_SIZE + adpcmBytes);
@@ -1731,7 +1765,7 @@ function decodeTrackBlob(data) {
   }
   const buf = new AudioBuffer({ length: sampleCount, sampleRate: storedSampleRate, numberOfChannels: 1 });
   buf.getChannelData(0).set(pcm);
-  return { audioBuf: buf, recordSpeedShift, recordedChannel };
+  return { audioBuf: buf, recordSpeedShift, recordedChannel, cv1PitchEnabled };
 }
 
 /** Read all tracks from device and populate waveform displays */
@@ -1746,8 +1780,11 @@ async function readAllTracks() {
     if (!info || info.sampleCount === 0) {
       if (info && info.recordedChannel !== null) {
         trackState[t].recordedChannel = info.recordedChannel;
+        trackState[t].cv1PitchEnabled = info.cv1PitchEnabled !== false;
         const chSel = document.getElementById(`channel-${t}`);
+        const cvSel = document.getElementById(`cv1pitch-${t}`);
         if (chSel) chSel.value = info.recordedChannel;
+        if (cvSel) cvSel.checked = trackState[t].cv1PitchEnabled;
       }
       trackState[t].audioBuffer = null;
       trackState[t].cropStart = 0;
@@ -1806,11 +1843,10 @@ async function readAllTracks() {
         trackState[t].speedIdx = speedShiftToIdx(decoded.recordSpeedShift);
         trackState[t].recordSpeedShift = decoded.recordSpeedShift;
         trackState[t].recordedChannel = decoded.recordedChannel;
-        trackState[t].gain = 1.0;
+        trackState[t].cv1PitchEnabled = decoded.cv1PitchEnabled;
         document.getElementById(`speed-${t}`).value = trackState[t].speedIdx;
         document.getElementById(`channel-${t}`).value = trackState[t].recordedChannel;
-        document.getElementById(`gain-${t}`).value = 0;
-        document.getElementById(`gain-val-${t}`).textContent = '0 dB';
+        document.getElementById(`cv1pitch-${t}`).checked = trackState[t].cv1PitchEnabled;
         updateCropForSpeed(t);
         drawWaveform(t);
       } else {

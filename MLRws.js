@@ -341,8 +341,45 @@ async function manualSerialDisconnect() {
   await serialDisconnect();
 }
 
+function clearDeviceVisualsAndBuffers() {
+  deviceTrackInfo = [];
+  stopAllPreviews();
+
+  for (let t = 0; t < MLR_NUM_TRACKS; t++) {
+    const st = trackState[t];
+    if (st) {
+      st.audioBuffer = null;
+      st.transients = [];
+      st.cropStart = 0;
+      st.cropEnd = 0;
+      st.recordSpeedShift = 0;
+      st.gain = 1.0;
+    }
+
+    const info = document.getElementById(`info-${t}`);
+    if (info) info.textContent = 'empty';
+
+    const pbar = document.getElementById(`pbar-${t}`);
+    if (pbar) pbar.style.width = '0%';
+
+    const gain = document.getElementById(`gain-${t}`);
+    const gainVal = document.getElementById(`gain-val-${t}`);
+    if (gain) gain.value = 0;
+    if (gainVal) gainVal.textContent = '0 dB';
+
+    const fileInput = document.getElementById(`file-${t}`);
+    if (fileInput) fileInput.value = '';
+
+    const ph = document.getElementById(`playhead-${t}`);
+    if (ph) ph.style.display = 'none';
+
+    drawWaveform(t);
+  }
+}
+
 async function handleUnexpectedDisconnect(message) {
   await serialDisconnect(false);
+  clearDeviceVisualsAndBuffers();
   setStatus(message);
   if (autoReconnectEnabled && !isManualDisconnect && selectedPort) {
     scheduleAutoReconnect();
@@ -417,8 +454,7 @@ async function reconnectToSelectedPort() {
   try {
     setStatus('Attempting to reconnect...');
     await serialConnect({ auto: true });
-    setStatus('Attempting to reconnect...');
-    await initialiseDeviceConnection({ quietStatus: true });
+    await initialiseDeviceConnection();
     await rememberConnectedPort();
   } catch (e) {
     if (port || reader || writer) {
@@ -575,19 +611,18 @@ async function requireInitialSync(timeoutMs = 5000) {
   throw new Error('Device did not enter sample-manager mode');
 }
 
-async function initialiseDeviceConnection(options = {}) {
-  const { quietStatus = false } = options;
+async function initialiseDeviceConnection() {
   let lastError = null;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       console.debug(`Connection init attempt ${attempt + 1}/5: waking sample manager`);
-      if (!quietStatus) setStatus('Waking sample manager...');
+      setStatus('Waking sample manager...');
       await requireInitialSync();
-      if (!quietStatus) setStatus('Reading device metadata...');
+      setStatus('Reading device metadata...');
       await refreshInfo({ skipSync: true });
       updateUIForDeviceMode();
-      if (!quietStatus) setStatus('Loading tracks from device...');
-      await readAllTracks({ quietStatus });
+      setStatus('Loading tracks from device...');
+      await readAllTracks();
       console.debug(`Connection init attempt ${attempt + 1}/5 succeeded`);
       return;
     } catch (e) {
@@ -595,7 +630,7 @@ async function initialiseDeviceConnection(options = {}) {
       console.warn(`Connection init attempt ${attempt + 1}/5 failed:`, e);
       readBuffer = new Uint8Array(0);
       if (attempt < 4) {
-        if (!quietStatus) setStatus('Waiting for device to settle...');
+        setStatus('Waiting for device to settle...');
         await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
       }
     }
@@ -1596,6 +1631,7 @@ function previewTrack(t, forceRestart = false) {
   buf.getChannelData(0).set(decoded);
   const src = actx.createBufferSource();
   src.buffer = buf;
+  src.loop = true;
   src.connect(actx.destination);
   src.onended = () => {
     actx.close();
@@ -1616,7 +1652,7 @@ function previewTrack(t, forceRestart = false) {
     const ps = previewState[t];
     if (!ps) return;
     const elapsed = ps.actx.currentTime - ps.startTime;
-    const progress = Math.min(1, elapsed / ps.duration);
+    const progress = ps.duration > 0 ? ((elapsed % ps.duration) / ps.duration) : 0;
     const st2 = trackState[t];
     const len = st2.audioBuffer ? st2.audioBuffer.length : 1;
     const samplePos = st2.cropStart + progress * (st2.cropEnd - st2.cropStart);
@@ -1627,7 +1663,7 @@ function previewTrack(t, forceRestart = false) {
       ph.style.left = px + 'px';
       ph.style.display = 'block';
     }
-    if (progress < 1) requestAnimationFrame(animatePlayhead);
+    requestAnimationFrame(animatePlayhead);
   }
   requestAnimationFrame(animatePlayhead);
   setStatus(`Preview ch ${getRecordedChannel(t) + 1}: ${duration.toFixed(2)}s, ADPCM at ${Math.round(targetRate)}Hz (${speed.name}, rec ${speedShiftToLabel(st.recordSpeedShift ?? 0)})`);
@@ -1699,8 +1735,7 @@ function decodeTrackBlob(data) {
 }
 
 /** Read all tracks from device and populate waveform displays */
-async function readAllTracks(options = {}) {
-  const { quietStatus = false } = options;
+async function readAllTracks() {
   if (!port) return;
   const trackInfo = deviceTrackInfo.length === MLR_NUM_TRACKS ? deviceTrackInfo : await cmdInfo();
   const nonEmptyTracks = trackInfo.filter(t => t.sampleCount > 0);
@@ -1723,7 +1758,7 @@ async function readAllTracks(options = {}) {
     }
 
     nonEmptyIndex++;
-    if (!quietStatus) setStatus(`Reading track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})...`);
+    setStatus(`Reading track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})...`);
     await yieldToUi();
     let data = null;
     let lastProgressTime = 0;
@@ -1739,14 +1774,14 @@ async function readAllTracks(options = {}) {
             if (percent % 10 === 0 || percent === 100) {
               console.debug(`Track ${t + 1} read progress: ${received}/${totalLen} bytes (${percent}%)`);
             }
-            if (!quietStatus) setStatus(`Reading track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})... ${percent}%`);
+            setStatus(`Reading track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})... ${percent}%`);
           }
         });
         break;
       } catch (e) {
         console.warn(`Track ${t + 1} read attempt ${attempt + 1}/3 failed:`, e);
         if (attempt < 2) {
-          if (!quietStatus) setStatus(`Track ${t + 1} read interrupted, retrying...`);
+          setStatus(`Track ${t + 1} read interrupted, retrying...`);
           await new Promise(r => setTimeout(r, 500));
         } else {
           console.error(`Track ${t + 1} read failed after 3 attempts:`, e);
@@ -1760,7 +1795,7 @@ async function readAllTracks(options = {}) {
       trackState[t].cropEnd = 0;
       trackState[t].transients = [];
     } else {
-      if (!quietStatus) setStatus(`Processing track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})...`);
+      setStatus(`Processing track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})...`);
       await yieldToUi();
       const decoded = decodeTrackBlob(data);
       if (decoded) {
@@ -1785,7 +1820,7 @@ async function readAllTracks(options = {}) {
     drawWaveform(t);
     await yieldToUi();
   }
-  setStatus(quietStatus ? 'Reconnected' : 'All tracks loaded');
+  setStatus('All tracks loaded');
 }
 
 /** Update speed dropdowns and heading after connection. */

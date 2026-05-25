@@ -372,7 +372,7 @@ async function openSerialPort(nextPort, auto = false) {
   readBuffer = new Uint8Array(0);
   notifyReadBufferWaiters();
   readLoop(r);
-  setStatus(auto ? 'Reconnected — preparing device...' : 'Connected — preparing device...');
+  if (!auto) setStatus('Connected — preparing device...');
   updateConnectButton();
 }
 
@@ -415,16 +415,17 @@ async function reconnectToSelectedPort() {
 
   reconnectInProgress = true;
   try {
-    setStatus('Reconnecting to device...');
+    setStatus('Attempting to reconnect...');
     await serialConnect({ auto: true });
-    await initialiseDeviceConnection();
+    setStatus('Attempting to reconnect...');
+    await initialiseDeviceConnection({ quietStatus: true });
     await rememberConnectedPort();
   } catch (e) {
     if (port || reader || writer) {
       await serialDisconnect(false);
     }
     if (autoReconnectEnabled && selectedPort) {
-      setStatus('Reconnect failed: ' + e.message);
+      setStatus('Attempting to reconnect...');
     }
   } finally {
     reconnectInProgress = false;
@@ -574,18 +575,19 @@ async function requireInitialSync(timeoutMs = 5000) {
   throw new Error('Device did not enter sample-manager mode');
 }
 
-async function initialiseDeviceConnection() {
+async function initialiseDeviceConnection(options = {}) {
+  const { quietStatus = false } = options;
   let lastError = null;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       console.debug(`Connection init attempt ${attempt + 1}/5: waking sample manager`);
-      setStatus('Waking sample manager...');
+      if (!quietStatus) setStatus('Waking sample manager...');
       await requireInitialSync();
-      setStatus('Reading device metadata...');
+      if (!quietStatus) setStatus('Reading device metadata...');
       await refreshInfo({ skipSync: true });
       updateUIForDeviceMode();
-      setStatus('Loading tracks from device...');
-      await readAllTracks();
+      if (!quietStatus) setStatus('Loading tracks from device...');
+      await readAllTracks({ quietStatus });
       console.debug(`Connection init attempt ${attempt + 1}/5 succeeded`);
       return;
     } catch (e) {
@@ -593,7 +595,7 @@ async function initialiseDeviceConnection() {
       console.warn(`Connection init attempt ${attempt + 1}/5 failed:`, e);
       readBuffer = new Uint8Array(0);
       if (attempt < 4) {
-        setStatus('Waiting for device to settle...');
+        if (!quietStatus) setStatus('Waiting for device to settle...');
         await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
       }
     }
@@ -1697,7 +1699,8 @@ function decodeTrackBlob(data) {
 }
 
 /** Read all tracks from device and populate waveform displays */
-async function readAllTracks() {
+async function readAllTracks(options = {}) {
+  const { quietStatus = false } = options;
   if (!port) return;
   const trackInfo = deviceTrackInfo.length === MLR_NUM_TRACKS ? deviceTrackInfo : await cmdInfo();
   const nonEmptyTracks = trackInfo.filter(t => t.sampleCount > 0);
@@ -1720,7 +1723,7 @@ async function readAllTracks() {
     }
 
     nonEmptyIndex++;
-    setStatus(`Reading track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})...`);
+    if (!quietStatus) setStatus(`Reading track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})...`);
     await yieldToUi();
     let data = null;
     let lastProgressTime = 0;
@@ -1736,14 +1739,14 @@ async function readAllTracks() {
             if (percent % 10 === 0 || percent === 100) {
               console.debug(`Track ${t + 1} read progress: ${received}/${totalLen} bytes (${percent}%)`);
             }
-            setStatus(`Reading track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})... ${percent}%`);
+            if (!quietStatus) setStatus(`Reading track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})... ${percent}%`);
           }
         });
         break;
       } catch (e) {
         console.warn(`Track ${t + 1} read attempt ${attempt + 1}/3 failed:`, e);
         if (attempt < 2) {
-          setStatus(`Track ${t + 1} read interrupted, retrying...`);
+          if (!quietStatus) setStatus(`Track ${t + 1} read interrupted, retrying...`);
           await new Promise(r => setTimeout(r, 500));
         } else {
           console.error(`Track ${t + 1} read failed after 3 attempts:`, e);
@@ -1757,7 +1760,7 @@ async function readAllTracks() {
       trackState[t].cropEnd = 0;
       trackState[t].transients = [];
     } else {
-      setStatus(`Processing track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})...`);
+      if (!quietStatus) setStatus(`Processing track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})...`);
       await yieldToUi();
       const decoded = decodeTrackBlob(data);
       if (decoded) {
@@ -1782,7 +1785,7 @@ async function readAllTracks() {
     drawWaveform(t);
     await yieldToUi();
   }
-  setStatus('All tracks loaded');
+  setStatus(quietStatus ? 'Reconnected' : 'All tracks loaded');
 }
 
 /** Update speed dropdowns and heading after connection. */

@@ -800,13 +800,6 @@ function getDeviceTrackInfo(t) {
   return deviceTrackInfo.find(info => info.index === t) || deviceTrackInfo[t] || null;
 }
 
-function isTrackEmptyForSplit(t) {
-  if (t < 0 || t >= MLR_NUM_TRACKS) return false;
-  if (trackState[t] && trackState[t].audioBuffer) return false;
-  const info = getDeviceTrackInfo(t);
-  return !info || info.sampleCount === 0;
-}
-
 function setTrackChannel(t, recordedChannel) {
   if (!trackState[t]) return;
   trackState[t].recordedChannel = recordedChannel & 0x01;
@@ -1419,35 +1412,6 @@ async function uploadTrack(t) {
   const gain = st.gain || 1.0;
   const cropStart = st.cropStart;
   const cropEnd = st.cropEnd;
-
-  const splitCandidate = st.audioBuffer.numberOfChannels >= 2 &&
-    t + 1 < MLR_NUM_TRACKS &&
-    isTrackEmptyForSplit(t + 1);
-
-  if (splitCandidate && confirm(`Split this stereo file over tracks ${t + 1} and ${t + 2}?\n\nTrack ${t + 1}: left source channel to Channel 1\nTrack ${t + 2}: right source channel to Channel 2`)) {
-    try {
-      setStatus(`Encoding tracks ${t + 1} and ${t + 2} at ${speed.name}...`);
-      const left = prepareTrackUpload(st.audioBuffer, 0, speed, cropStart, cropEnd, gain, 0);
-      const right = prepareTrackUpload(st.audioBuffer, 1, speed, cropStart, cropEnd, gain, 1);
-
-      setTrackChannel(t, 0);
-      trackState[t + 1].speedIdx = st.speedIdx;
-      document.getElementById(`speed-${t + 1}`).value = trackState[t + 1].speedIdx;
-      setTrackChannel(t + 1, 1);
-
-      const leftResult = await writePreparedTrack(t, left);
-      await writePreparedTrack(t + 1, right);
-      refreshInfo().catch(() => {});
-      setStatus(`Stereo split uploaded: tracks ${t + 1}/${t + 2}, ${leftResult.dur}s each`);
-    } catch (e) {
-      setStatus('Split upload error: ' + e.message);
-      const pbarA = document.getElementById(`pbar-${t}`);
-      const pbarB = document.getElementById(`pbar-${t + 1}`);
-      if (pbarA) pbarA.style.width = '0%';
-      if (pbarB) pbarB.style.width = '0%';
-    }
-    return;
-  }
 
   setStatus(`Encoding track ${t + 1} at ${speed.name}...`);
   try {

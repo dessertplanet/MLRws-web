@@ -1,8 +1,6 @@
 // ---- Constants (must match firmware mlr.h) ----
 const MLR_NUM_TRACKS = 6;
-const MLR_MAGIC_MONO   = 0x4D4C5234;  // 'MLR4'
-const MLR_MAGIC_STEREO = 0x4D4C5235;  // 'MLR5'
-function getMLRMagic() { return deviceChannels === 2 ? MLR_MAGIC_STEREO : MLR_MAGIC_MONO; }
+const MLR_MAGIC = 0x4D4C5234;  // 'MLR4'
 const MLR_HEADER_SIZE = 4096;
 const MLR_TRACK_FLASH_SIZE = 312 * 1024;
 const MLR_AUDIO_SIZE = MLR_TRACK_FLASH_SIZE - MLR_HEADER_SIZE;
@@ -11,9 +9,8 @@ const MLR_KEYFRAME_INTERVAL = 1024;
 const MLR_MAX_KEYFRAMES = Math.floor(MLR_MAX_SAMPLES / MLR_KEYFRAME_INTERVAL) + 1;
 const MLR_KEYFRAME_OFFSET = 20;  // bytes before keyframes[] in header
 
-/** Max sample frames for the connected device (changes with mono/stereo) */
 function getMaxSamples() {
-  return deviceChannels === 2 ? MLR_AUDIO_SIZE : MLR_MAX_SAMPLES;
+  return MLR_MAX_SAMPLES;
 }
 
 const SPEEDS = [
@@ -111,97 +108,25 @@ function adpcmEncode(samples16) {
   return { adpcmBytes: adpcmBytes.slice(0, Math.ceil(nSamples / 2)), keyframes, sampleCount: nSamples };
 }
 
-/** Stereo ADPCM encoder using Mid-Side transform.
- *  M = (L+R)/2, S = (L-R)/2.  M nybble (low) + S nybble (high) per byte. */
-function adpcmEncodeStereo(samplesL, samplesR) {
-  const nFrames = samplesL.length;
-  const adpcmBytes = new Uint8Array(nFrames);
-  const keyframes = [];
-  let predM = 0, stepIdxM = 0;
-  let predS = 0, stepIdxS = 0;
-
-  for (let i = 0; i < nFrames; i++) {
-    if ((i % MLR_KEYFRAME_INTERVAL) === 0) {
-      keyframes.push({ predictorL: predM, stepIndexL: stepIdxM, predictorR: predS, stepIndexR: stepIdxS });
-    }
-
-    // Mid-Side transform
-    const mid  = (samplesL[i] + samplesR[i]) >> 1;
-    const side = (samplesL[i] - samplesR[i]) >> 1;
-
-    // Encode Mid
-    const stepM = IMA_STEP_TABLE[stepIdxM];
-    let diffM = mid - predM;
-    let nybM = 0;
-    if (diffM < 0) { nybM = 8; diffM = -diffM; }
-    if (diffM >= stepM)     { nybM |= 4; diffM -= stepM; }
-    if (diffM >= stepM/2)   { nybM |= 2; diffM -= stepM/2; }
-    if (diffM >= stepM/4)   { nybM |= 1; }
-    let deltaM = stepM >> 3;
-    if (nybM & 4) deltaM += stepM;
-    if (nybM & 2) deltaM += stepM >> 1;
-    if (nybM & 1) deltaM += stepM >> 2;
-    predM += (nybM & 8) ? -deltaM : deltaM;
-    if (predM > 32767) predM = 32767;
-    if (predM < -32768) predM = -32768;
-    stepIdxM += IMA_INDEX_TABLE[nybM & 0xF];
-    if (stepIdxM < 0) stepIdxM = 0;
-    if (stepIdxM > 88) stepIdxM = 88;
-
-    // Encode Side
-    const stepS = IMA_STEP_TABLE[stepIdxS];
-    let diffS = side - predS;
-    let nybS = 0;
-    if (diffS < 0) { nybS = 8; diffS = -diffS; }
-    if (diffS >= stepS)     { nybS |= 4; diffS -= stepS; }
-    if (diffS >= stepS/2)   { nybS |= 2; diffS -= stepS/2; }
-    if (diffS >= stepS/4)   { nybS |= 1; }
-    let deltaS = stepS >> 3;
-    if (nybS & 4) deltaS += stepS;
-    if (nybS & 2) deltaS += stepS >> 1;
-    if (nybS & 1) deltaS += stepS >> 2;
-    predS += (nybS & 8) ? -deltaS : deltaS;
-    if (predS > 32767) predS = 32767;
-    if (predS < -32768) predS = -32768;
-    stepIdxS += IMA_INDEX_TABLE[nybS & 0xF];
-    if (stepIdxS < 0) stepIdxS = 0;
-    if (stepIdxS > 88) stepIdxS = 88;
-
-    adpcmBytes[i] = (nybM & 0xF) | ((nybS & 0xF) << 4);
-  }
-
-  return { adpcmBytes, keyframes, sampleCount: nFrames };
-}
-
-function buildTrackBlob(encoded, recordSpeedShift = 0) {
+function buildTrackBlob(encoded, recordSpeedShift = 0, recordedChannel = 0) {
   const { adpcmBytes, keyframes, sampleCount } = encoded;
   const headerBuf = new ArrayBuffer(MLR_HEADER_SIZE);
   const hdr = new DataView(headerBuf);
   const hdrU8 = new Uint8Array(headerBuf);
   hdrU8.fill(0xFF);
 
-  hdr.setUint32(0, getMLRMagic(), true);
+  hdr.setUint32(0, MLR_MAGIC, true);
   hdr.setUint32(4, sampleCount, true);
   hdr.setUint32(8, adpcmBytes.length, true);
   hdr.setUint32(12, keyframes.length, true);
   hdr.setInt8(16, recordSpeedShift);
-  hdr.setUint8(17, 0); hdr.setUint8(18, 0); hdr.setUint8(19, 0);
+  hdr.setUint8(17, recordedChannel & 0x01); hdr.setUint8(18, 0); hdr.setUint8(19, 0);
 
   for (let i = 0; i < keyframes.length && i < MLR_MAX_KEYFRAMES; i++) {
-    if (deviceChannels === 2) {
-      const off = MLR_KEYFRAME_OFFSET + i * 8;
-      hdr.setInt16(off, keyframes[i].predictorL, true);
-      hdr.setInt8(off + 2, keyframes[i].stepIndexL);
-      hdr.setUint8(off + 3, 0);
-      hdr.setInt16(off + 4, keyframes[i].predictorR, true);
-      hdr.setInt8(off + 6, keyframes[i].stepIndexR);
-      hdr.setUint8(off + 7, 0);
-    } else {
-      const off = MLR_KEYFRAME_OFFSET + i * 4;
-      hdr.setInt16(off, keyframes[i].predictor, true);
-      hdr.setInt8(off + 2, keyframes[i].stepIndex);
-      hdr.setUint8(off + 3, 0);
-    }
+    const off = MLR_KEYFRAME_OFFSET + i * 4;
+    hdr.setInt16(off, keyframes[i].predictor, true);
+    hdr.setInt8(off + 2, keyframes[i].stepIndex);
+    hdr.setUint8(off + 3, 0);
   }
 
   const total = new Uint8Array(MLR_HEADER_SIZE + adpcmBytes.length);
@@ -211,8 +136,9 @@ function buildTrackBlob(encoded, recordSpeedShift = 0) {
 }
 
 // ---- Transient detection ----
-function detectTransients(audioBuffer, threshold = 0.15) {
-  const data = audioBuffer.getChannelData(0);
+function detectTransients(audioBuffer, threshold = 0.15, channelIndex = 0) {
+  const ch = Math.max(0, Math.min(audioBuffer.numberOfChannels - 1, channelIndex | 0));
+  const data = audioBuffer.getChannelData(ch);
   const sr = audioBuffer.sampleRate;
   const windowSize = Math.floor(sr * 0.01); // 10ms windows
   const transients = [0]; // always include start
@@ -277,6 +203,13 @@ let writer = null;
 let readBuffer = new Uint8Array(0);
 let readBufferWaiters = [];
 let isDisconnecting = false;
+let selectedPort = null;
+let selectedPortInfo = null;
+let autoReconnectEnabled = false;
+let autoReconnectTimer = null;
+let isManualDisconnect = false;
+let reconnectInProgress = false;
+const reconnectDelayMs = 900;
 
 function notifyReadBufferWaiters() {
   if (readBufferWaiters.length === 0) return;
@@ -309,6 +242,60 @@ function isSerialConnected() {
 function updateConnectButton() {
   const btn = document.getElementById('connect-btn');
   if (btn) btn.textContent = isSerialConnected() ? 'Disconnect' : 'Connect';
+}
+
+function getPortInfo(serialPort) {
+  try {
+    return serialPort?.getInfo?.() || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function isSamePort(portA, portB, preferredInfo = null) {
+  if (!portA || !portB) return false;
+  if (portA === portB) return true;
+
+  const infoA = getPortInfo(portA);
+  const infoB = preferredInfo || getPortInfo(portB);
+  if (!infoA || !infoB) return false;
+
+  return infoA.usbVendorId === infoB.usbVendorId &&
+         infoA.usbProductId === infoB.usbProductId;
+}
+
+function findMatchingPort(ports, preferredPort, preferredInfo = null) {
+  if (!Array.isArray(ports) || ports.length === 0) return null;
+
+  const exactMatch = ports.find(serialPort => serialPort === preferredPort);
+  if (exactMatch) return exactMatch;
+
+  if (!preferredInfo) return null;
+
+  return ports.find(serialPort => {
+    const info = getPortInfo(serialPort);
+    if (!info) return false;
+    return info.usbVendorId === preferredInfo.usbVendorId &&
+           info.usbProductId === preferredInfo.usbProductId;
+  }) || null;
+}
+
+function clearAutoReconnectTimer() {
+  if (!autoReconnectTimer) return;
+  clearTimeout(autoReconnectTimer);
+  autoReconnectTimer = null;
+}
+
+function scheduleAutoReconnect(delay = reconnectDelayMs) {
+  if (!autoReconnectEnabled || isSerialConnected() || !selectedPort || autoReconnectTimer || reconnectInProgress) {
+    return;
+  }
+
+  autoReconnectTimer = setTimeout(async () => {
+    autoReconnectTimer = null;
+    if (!autoReconnectEnabled || isSerialConnected() || reconnectInProgress) return;
+    await reconnectToSelectedPort();
+  }, delay);
 }
 
 async function serialDisconnect(showStatusMessage = true) {
@@ -345,27 +332,104 @@ async function serialDisconnect(showStatusMessage = true) {
   if (showStatusMessage) setStatus('Disconnected');
 }
 
+async function manualSerialDisconnect() {
+  isManualDisconnect = true;
+  autoReconnectEnabled = false;
+  clearAutoReconnectTimer();
+  await serialDisconnect();
+}
+
 async function handleUnexpectedDisconnect(message) {
   await serialDisconnect(false);
   setStatus(message);
+  if (autoReconnectEnabled && !isManualDisconnect && selectedPort) {
+    scheduleAutoReconnect();
+  }
 }
 
-async function serialConnect() {
-  if (isSerialConnected()) {
-    await serialDisconnect(false);
+async function chooseReconnectPort() {
+  if (!selectedPort) return null;
+
+  if (navigator.serial && typeof navigator.serial.getPorts === 'function') {
+    try {
+      const availablePorts = await navigator.serial.getPorts();
+      const matchingPort = findMatchingPort(availablePorts, selectedPort, selectedPortInfo);
+      if (matchingPort) return matchingPort;
+    } catch (_) {}
   }
 
-  port = await navigator.serial.requestPort();
+  return selectedPort;
+}
+
+async function openSerialPort(nextPort, auto = false) {
+  port = nextPort;
   await port.open({ baudRate: 115200 });
   writer = port.writable.getWriter();
   const r = port.readable.getReader();
   reader = r;
   readBuffer = new Uint8Array(0);
   notifyReadBufferWaiters();
-  // Start background read loop
   readLoop(r);
-  setStatus('Connected');
+  setStatus(auto ? 'Reconnected — preparing device...' : 'Connected — preparing device...');
   updateConnectButton();
+}
+
+async function serialConnect(options = {}) {
+  const { auto = false } = options;
+
+  if (isSerialConnected()) {
+    await serialDisconnect(false);
+  }
+
+  const rememberedPort = await chooseReconnectPort();
+  if (rememberedPort) {
+    try {
+      await openSerialPort(rememberedPort, auto);
+      return;
+    } catch (e) {
+      if (port || reader || writer) {
+        await serialDisconnect(false);
+      }
+      if (auto) throw e;
+    }
+  }
+
+  if (auto) throw new Error('No previously permitted serial port found');
+
+  const requestedPort = await navigator.serial.requestPort();
+  await openSerialPort(requestedPort, false);
+}
+
+async function rememberConnectedPort() {
+  selectedPort = port;
+  selectedPortInfo = getPortInfo(port);
+  autoReconnectEnabled = true;
+  isManualDisconnect = false;
+  clearAutoReconnectTimer();
+}
+
+async function reconnectToSelectedPort() {
+  if (reconnectInProgress || isSerialConnected()) return;
+
+  reconnectInProgress = true;
+  try {
+    setStatus('Reconnecting to device...');
+    await serialConnect({ auto: true });
+    await initialiseDeviceConnection();
+    await rememberConnectedPort();
+  } catch (e) {
+    if (port || reader || writer) {
+      await serialDisconnect(false);
+    }
+    if (autoReconnectEnabled && selectedPort) {
+      setStatus('Reconnect failed: ' + e.message);
+    }
+  } finally {
+    reconnectInProgress = false;
+    if (autoReconnectEnabled && !isSerialConnected() && selectedPort) {
+      scheduleAutoReconnect();
+    }
+  }
 }
 
 async function readLoop(r) {
@@ -450,7 +514,7 @@ function findByteSequence(haystack, needle) {
  * Drains any stale data (e.g. from a stuck read stream) in the process.
  * Falls back gracefully if firmware is older and doesn't support 'X'.
  */
-async function cmdSync() {
+async function cmdSync(required = true) {
   if (!port || !writer) return;
   readBuffer = new Uint8Array(0);
   await serialWrite('X');
@@ -463,7 +527,7 @@ async function cmdSync() {
       // Brief drain to catch duplicate SYNCs from pipelined requests
       await new Promise(r => setTimeout(r, 30));
       readBuffer = new Uint8Array(0);
-      return;
+      return true;
     }
     try {
       await waitForIncomingData(Math.max(10, deadline - Date.now()));
@@ -471,24 +535,63 @@ async function cmdSync() {
       break;
     }
   }
-  // No SYNC received — clear buffer (backward compat with old firmware)
   readBuffer = new Uint8Array(0);
+  if (required) throw new Error('Device did not acknowledge command sync');
+  return false;
+}
+
+async function requireInitialSync(timeoutMs = 5000) {
+  if (!port || !writer) throw new Error('Disconnected');
+
+  const syncMarker = new TextEncoder().encode('SYNC\n');
+  const deadline = Date.now() + timeoutMs;
+  readBuffer = new Uint8Array(0);
+
+  while (Date.now() < deadline) {
+    await serialWrite('X');
+    const attemptDeadline = Math.min(Date.now() + 500, deadline);
+
+    while (Date.now() < attemptDeadline) {
+      const idx = findByteSequence(readBuffer, syncMarker);
+      if (idx >= 0) {
+        readBuffer = readBuffer.slice(idx + syncMarker.length);
+        await new Promise(r => setTimeout(r, 30));
+        readBuffer = new Uint8Array(0);
+        return;
+      }
+
+      try {
+        await waitForIncomingData(Math.max(10, attemptDeadline - Date.now()));
+      } catch (_) {
+        break;
+      }
+    }
+  }
+
+  readBuffer = new Uint8Array(0);
+  throw new Error('Device did not enter sample-manager mode');
 }
 
 async function initialiseDeviceConnection() {
   let lastError = null;
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
+      console.debug(`Connection init attempt ${attempt + 1}/5: waking sample manager`);
+      setStatus('Waking sample manager...');
+      await requireInitialSync();
+      setStatus('Reading device metadata...');
       await refreshInfo();
       updateUIForDeviceMode();
-      setStatus(`Connected (${deviceChannels === 2 ? 'stereo' : 'mono'}) — reading tracks...`);
+      setStatus('Loading tracks from device...');
       await readAllTracks();
+      console.debug(`Connection init attempt ${attempt + 1}/5 succeeded`);
       return;
     } catch (e) {
       lastError = e;
+      console.warn(`Connection init attempt ${attempt + 1}/5 failed:`, e);
       readBuffer = new Uint8Array(0);
       if (attempt < 4) {
-        setStatus(`Waiting for device... (${attempt + 1}/5)`);
+        setStatus('Waiting for device to settle...');
         await new Promise(r => setTimeout(r, 250 * (attempt + 1)));
       }
     }
@@ -496,21 +599,29 @@ async function initialiseDeviceConnection() {
   throw lastError || new Error('Unable to initialise device connection');
 }
 
-let deviceChannels = 1;  // detected on connect: 1 = mono, 2 = stereo
 let deviceTrackInfo = [];
 
 // ---- Track commands ----
 async function cmdInfo() {
   await cmdSync();
   await serialWrite('I');
-  const header = await waitForLine();
+  let header;
+  try {
+    header = await waitForLine(2500);
+  } catch (e) {
+    throw new Error('Timed out waiting for metadata header');
+  }
   const headerParts = header.split(' ');
   if (headerParts[0] !== 'MLR1') throw new Error('Bad info response: ' + header);
-  deviceChannels = headerParts.length > 1 ? parseInt(headerParts[1]) : 1;
 
   const tracks = [];
   while (true) {
-    const line = await waitForLine();
+    let line;
+    try {
+      line = await waitForLine(2500);
+    } catch (e) {
+      throw new Error(`Timed out waiting for metadata line ${tracks.length + 1}`);
+    }
     if (line === 'END') break;
 
     const parts = line.split(' ');
@@ -524,6 +635,7 @@ async function cmdInfo() {
       adpcmBytes: parseInt(parts[2], 10),
       numKeyframes: parseInt(parts[3], 10),
       recordSpeedShift: parts.length > 4 ? parseInt(parts[4], 10) : 0,
+      recordedChannel: parts.length > 5 ? (parseInt(parts[5], 10) & 0x01) : null,
     });
   }
 
@@ -593,13 +705,43 @@ async function cmdRead(track, progressCb) {
   const data = new Uint8Array(totalLen);
   let received = 0;
   const deadline = Date.now() + 60000;
+  let idleDeadline = Date.now() + 15000;
+  let recoveredShortTail = false;
   while (received < totalLen) {
-    if (Date.now() > deadline) throw new Error('Timeout waiting for track data');
+    if (Date.now() > deadline) {
+      throw new Error(`Timeout waiting for track ${track + 1} data (${received}/${totalLen} bytes)`);
+    }
 
     if (readBuffer.length === 0) {
       const remaining = deadline - Date.now();
-      if (remaining <= 0) throw new Error('Timeout waiting for track data');
-      await waitForIncomingData(remaining);
+      if (remaining <= 0) {
+        throw new Error(`Timeout waiting for track ${track + 1} data (${received}/${totalLen} bytes)`);
+      }
+      const idleRemaining = idleDeadline - Date.now();
+      if (idleRemaining <= 0) {
+        const missing = totalLen - received;
+        if (missing > 0 && missing <= 64) {
+          data.fill(0xFF, received);
+          console.warn(`Recovered short tail while reading track ${track + 1}; padded ${missing} missing byte(s)`);
+          received = totalLen;
+          recoveredShortTail = true;
+          break;
+        }
+        throw new Error(`Stalled reading track ${track + 1} data (${received}/${totalLen} bytes)`);
+      }
+      try {
+        await waitForIncomingData(Math.min(remaining, idleRemaining));
+      } catch (_) {
+        const missing = totalLen - received;
+        if (missing > 0 && missing <= 64) {
+          data.fill(0xFF, received);
+          console.warn(`Recovered short tail while reading track ${track + 1}; padded ${missing} missing byte(s)`);
+          received = totalLen;
+          recoveredShortTail = true;
+          break;
+        }
+        throw new Error(`Stalled reading track ${track + 1} data (${received}/${totalLen} bytes)`);
+      }
       continue;
     }
 
@@ -607,18 +749,21 @@ async function cmdRead(track, progressCb) {
     data.set(readBuffer.slice(0, chunk), received);
     readBuffer = readBuffer.slice(chunk);
     received += chunk;
+    idleDeadline = Date.now() + 15000;
 
-    if (progressCb) progressCb(received / totalLen);
+    if (progressCb) progressCb(received / totalLen, received, totalLen);
   }
 
   // Verify end-of-stream marker from firmware
-  try {
-    const doneLine = await waitForLine(5000);
-    if (doneLine !== 'DONE') {
-      console.warn('Expected DONE after read, got:', doneLine);
+  if (!recoveredShortTail) {
+    try {
+      const doneLine = await waitForLine(5000);
+      if (doneLine !== 'DONE') {
+        console.warn('Expected DONE after read, got:', doneLine);
+      }
+    } catch (_) {
+      console.warn('No DONE marker received after read (old firmware?)');
     }
-  } catch (_) {
-    console.warn('No DONE marker received after read (old firmware?)');
   }
 
   await yieldToUi();
@@ -631,6 +776,43 @@ function setStatus(msg) {
 }
 
 const trackState = [];
+
+function getRecordedChannel(t) {
+  const st = trackState[t];
+  return st && st.recordedChannel === 1 ? 1 : 0;
+}
+
+function getSourceChannelIndex(st) {
+  if (!st || !st.audioBuffer) return 0;
+  return (st.recordedChannel === 1 && st.audioBuffer.numberOfChannels > 1) ? 1 : 0;
+}
+
+function selectedSourceChannelLabel(st) {
+  const sourceChannel = getSourceChannelIndex(st);
+  return `source ${sourceChannel + 1}`;
+}
+
+function getSelectedChannelData(st) {
+  return st.audioBuffer.getChannelData(getSourceChannelIndex(st));
+}
+
+function getDeviceTrackInfo(t) {
+  return deviceTrackInfo.find(info => info.index === t) || deviceTrackInfo[t] || null;
+}
+
+function isTrackEmptyForSplit(t) {
+  if (t < 0 || t >= MLR_NUM_TRACKS) return false;
+  if (trackState[t] && trackState[t].audioBuffer) return false;
+  const info = getDeviceTrackInfo(t);
+  return !info || info.sampleCount === 0;
+}
+
+function setTrackChannel(t, recordedChannel) {
+  if (!trackState[t]) return;
+  trackState[t].recordedChannel = recordedChannel & 0x01;
+  const chSel = document.getElementById(`channel-${t}`);
+  if (chSel) chSel.value = trackState[t].recordedChannel;
+}
 
 function createTrackUI() {
   const container = document.getElementById('tracks');
@@ -645,6 +827,7 @@ function createTrackUI() {
       speedIdx: 3, // normal
       gain: 1.0,   // linear gain applied before upload/preview
       recordSpeedShift: 0,
+      recordedChannel: 0,
     };
 
     const div = document.createElement('div');
@@ -658,6 +841,11 @@ function createTrackUI() {
         <label>Track ${t + 1}</label>
         <select id="speed-${t}">
           ${SPEEDS.map((s, i) => `<option value="${i}" ${i === 3 ? 'selected' : ''}>${s.name} (${maxSecs(s)}s)</option>`).join('')}
+        </select>
+        <label style="font-size:11px;margin-left:8px">Channel:</label>
+        <select id="channel-${t}">
+          <option value="0" ${trackState[t].recordedChannel === 0 ? 'selected' : ''}>1</option>
+          <option value="1" ${trackState[t].recordedChannel === 1 ? 'selected' : ''}>2</option>
         </select>
         <span class="track-drop-hint">drop audio file here</span>
         <label style="font-size:11px;margin-left:8px">Gain:</label>
@@ -699,6 +887,20 @@ function createTrackUI() {
       if (previewState[t]) {
         previewTrack(t, true);
       }
+    });
+
+    document.getElementById(`channel-${t}`).addEventListener('change', (e) => {
+      trackState[t].recordedChannel = parseInt(e.target.value, 10) & 0x01;
+      if (trackState[t].audioBuffer) {
+        trackState[t].transients = detectTransients(
+          trackState[t].audioBuffer,
+          0.15,
+          getSourceChannelIndex(trackState[t])
+        );
+        updateCropForSpeed(t);
+        drawWaveform(t);
+      }
+      if (previewState[t]) previewTrack(t, true);
     });
 
     // Gain slider
@@ -911,34 +1113,6 @@ async function loadAudioFile(t, file) {
     actx.close();
   }
 
-  // Match buffer channel count to the connected device.
-  if (audioBuf.numberOfChannels > 1 && deviceChannels === 1) {
-    const length = audioBuf.length;
-    const mono = new Float32Array(length);
-    for (let ch = 0; ch < audioBuf.numberOfChannels; ch++) {
-      const chData = audioBuf.getChannelData(ch);
-      for (let i = 0; i < length; i++) mono[i] += chData[i];
-    }
-    for (let i = 0; i < length; i++) mono[i] /= audioBuf.numberOfChannels;
-    audioBuf = createAudioBufferFromChannels([mono], audioBuf.sampleRate);
-  } else if (audioBuf.numberOfChannels > 2) {
-    const length = audioBuf.length;
-    const left = new Float32Array(length);
-    const right = new Float32Array(length);
-    for (let ch = 0; ch < audioBuf.numberOfChannels; ch++) {
-      const chData = audioBuf.getChannelData(ch);
-      const target = (ch % 2 === 0) ? left : right;
-      for (let i = 0; i < length; i++) target[i] += chData[i];
-    }
-    const lDiv = Math.ceil(audioBuf.numberOfChannels / 2);
-    const rDiv = Math.floor(audioBuf.numberOfChannels / 2);
-    for (let i = 0; i < length; i++) {
-      left[i] /= lDiv;
-      right[i] /= (rDiv || 1);
-    }
-    audioBuf = createAudioBufferFromChannels([left, right], audioBuf.sampleRate);
-  }
-
   // Peak-normalize all channels to 0 dBFS
   let peak = 0;
   for (let ch = 0; ch < audioBuf.numberOfChannels; ch++) {
@@ -959,7 +1133,7 @@ async function loadAudioFile(t, file) {
   }
 
   trackState[t].audioBuffer = audioBuf;
-  trackState[t].transients = detectTransients(audioBuf);
+  trackState[t].transients = detectTransients(audioBuf, 0.15, getSourceChannelIndex(trackState[t]));
   trackState[t].cropStart = 0;
   trackState[t].cropEnd = audioBuf.length;
 
@@ -967,7 +1141,10 @@ async function loadAudioFile(t, file) {
   drawWaveform(t);
 
   const dur = audioBuf.duration.toFixed(2);
-  setStatus(`Loaded ${file.name}: ${dur}s, ${audioBuf.sampleRate}Hz`);
+  const sourceNote = audioBuf.numberOfChannels > 1
+    ? `, upload uses ${selectedSourceChannelLabel(trackState[t])} for selected channel`
+    : '';
+  setStatus(`Loaded ${file.name}: ${dur}s, ${audioBuf.sampleRate}Hz${sourceNote}`);
 }
 
 function updateCropForSpeed(t) {
@@ -1013,7 +1190,7 @@ function drawWaveform(t) {
     return;
   }
 
-  const data = st.audioBuffer.getChannelData(0);
+  const data = getSelectedChannelData(st);
   const len = data.length;
   const gain = st.gain || 1.0;
 
@@ -1160,7 +1337,7 @@ function cropToSelection(t) {
   const newBuf = createAudioBufferFromChannels(channels, st.audioBuffer.sampleRate);
 
   st.audioBuffer = newBuf;
-  st.transients = detectTransients(newBuf);
+  st.transients = detectTransients(newBuf, 0.15, getSourceChannelIndex(st));
   st.cropStart = 0;
   st.cropEnd = newBuf.length;
 
@@ -1169,115 +1346,129 @@ function cropToSelection(t) {
   setStatus(`Cropped to ${newBuf.duration.toFixed(2)}s`);
 }
 
+function prepareTrackUpload(sourceBuffer, sourceChannel, speed, cropStart, cropEnd, gain, recordedChannel) {
+  const targetRate = recTargetRate(speed);
+  const srcData = sourceBuffer.getChannelData(sourceChannel);
+  const cropped = srcData.slice(cropStart, cropEnd);
+  const croppedBuf = new AudioBuffer({
+    length: cropped.length,
+    sampleRate: sourceBuffer.sampleRate,
+    numberOfChannels: 1
+  });
+  croppedBuf.getChannelData(0).set(cropped);
+
+  const samples16 = resampleBuffer(croppedBuf, targetRate, gain || 1.0);
+  const maxSamples = getMaxSamples();
+  if (samples16.length > maxSamples) {
+    throw new Error(`too many samples (${samples16.length} > ${maxSamples})`);
+  }
+
+  const encoded = adpcmEncode(samples16);
+  const blob = buildTrackBlob(encoded, speed.shift, recordedChannel);
+  if (blob.length > MLR_TRACK_FLASH_SIZE) {
+    throw new Error(`data too large (${blob.length} > ${MLR_TRACK_FLASH_SIZE})`);
+  }
+
+  return { blob, encoded, speed, recordedChannel };
+}
+
+async function writePreparedTrack(t, prepared) {
+  const { blob, encoded, speed, recordedChannel } = prepared;
+  setStatus(`Uploading track ${t + 1} (${blob.length} bytes)...`);
+  const pbar = document.getElementById(`pbar-${t}`);
+  await cmdWrite(t, blob, (pct) => { pbar.style.width = (pct * 100) + '%'; });
+  pbar.style.width = '100%';
+
+  // Update the UI from the exact blob we just wrote, instead of
+  // immediately re-reading the whole track back over serial.
+  if (previewState[t]) {
+    stopPreview(t, false);
+  }
+  const decoded = decodeTrackBlob(blob);
+  if (decoded) {
+    const st = trackState[t];
+    st.audioBuffer = decoded.audioBuf;
+    st.transients = detectTransients(decoded.audioBuf);
+    st.cropStart = 0;
+    st.cropEnd = decoded.audioBuf.length;
+    st.speedIdx = speedShiftToIdx(decoded.recordSpeedShift);
+    st.recordSpeedShift = decoded.recordSpeedShift;
+    st.recordedChannel = decoded.recordedChannel;
+    document.getElementById(`speed-${t}`).value = st.speedIdx;
+    document.getElementById(`channel-${t}`).value = st.recordedChannel;
+    st.gain = 1.0;
+    document.getElementById(`gain-${t}`).value = 0;
+    document.getElementById(`gain-val-${t}`).textContent = '0 dB';
+    updateCropForSpeed(t);
+    drawWaveform(t);
+  }
+
+  const dur = (encoded.sampleCount / (48000 * speed.ratio)).toFixed(2);
+  document.getElementById(`info-${t}`).textContent =
+    `${encoded.sampleCount} samples (${(encoded.sampleCount / 48000).toFixed(2)}s at 1x), ${encoded.adpcmBytes.length} bytes, rec ${speedShiftToLabel(speed.shift)}, ch ${recordedChannel + 1}`;
+  setTimeout(() => { pbar.style.width = '0%'; }, 2000);
+  return { dur, encoded };
+}
+
 async function uploadTrack(t) {
   const st = trackState[t];
   if (!st.audioBuffer) { setStatus('No audio loaded'); return; }
   if (!port) { setStatus('Not connected'); return; }
 
   const speed = SPEEDS[st.speedIdx];
-  const targetRate = recTargetRate(speed);
+  const gain = st.gain || 1.0;
+  const cropStart = st.cropStart;
+  const cropEnd = st.cropEnd;
+
+  const splitCandidate = st.audioBuffer.numberOfChannels >= 2 &&
+    t + 1 < MLR_NUM_TRACKS &&
+    isTrackEmptyForSplit(t + 1);
+
+  if (splitCandidate && confirm(`Split this stereo file over tracks ${t + 1} and ${t + 2}?\n\nTrack ${t + 1}: left source channel to Channel 1\nTrack ${t + 2}: right source channel to Channel 2`)) {
+    try {
+      setStatus(`Encoding tracks ${t + 1} and ${t + 2} at ${speed.name}...`);
+      const left = prepareTrackUpload(st.audioBuffer, 0, speed, cropStart, cropEnd, gain, 0);
+      const right = prepareTrackUpload(st.audioBuffer, 1, speed, cropStart, cropEnd, gain, 1);
+
+      setTrackChannel(t, 0);
+      trackState[t + 1].speedIdx = st.speedIdx;
+      document.getElementById(`speed-${t + 1}`).value = trackState[t + 1].speedIdx;
+      setTrackChannel(t + 1, 1);
+
+      const leftResult = await writePreparedTrack(t, left);
+      await writePreparedTrack(t + 1, right);
+      refreshInfo().catch(() => {});
+      setStatus(`Stereo split uploaded: tracks ${t + 1}/${t + 2}, ${leftResult.dur}s each`);
+    } catch (e) {
+      setStatus('Split upload error: ' + e.message);
+      const pbarA = document.getElementById(`pbar-${t}`);
+      const pbarB = document.getElementById(`pbar-${t + 1}`);
+      if (pbarA) pbarA.style.width = '0%';
+      if (pbarB) pbarB.style.width = '0%';
+    }
+    return;
+  }
 
   setStatus(`Encoding track ${t + 1} at ${speed.name}...`);
-
-  // Crop the audio buffer
-  const srcData = st.audioBuffer.getChannelData(0);
-  const cropped = srcData.slice(st.cropStart, st.cropEnd);
-  const hasStereoSrc = st.audioBuffer.numberOfChannels >= 2;
-  let croppedR = null;
-  if (deviceChannels === 2 && hasStereoSrc) {
-    croppedR = st.audioBuffer.getChannelData(1).slice(st.cropStart, st.cropEnd);
-  }
-
-  // Create temporary buffer for resampling
-  const croppedBuf = new AudioBuffer({
-    length: cropped.length,
-    sampleRate: st.audioBuffer.sampleRate,
-    numberOfChannels: 1
-  });
-  croppedBuf.getChannelData(0).set(cropped);
-  const trackGain = st.gain || 1.0;
-  const samples16 = resampleBuffer(croppedBuf, targetRate, trackGain);
-
-  // For stereo device: resample right channel too
-  let samples16R = null;
-  if (deviceChannels === 2) {
-    if (croppedR) {
-      const croppedBufR = new AudioBuffer({
-        length: croppedR.length,
-        sampleRate: st.audioBuffer.sampleRate,
-        numberOfChannels: 1
-      });
-      croppedBufR.getChannelData(0).set(croppedR);
-      samples16R = resampleBuffer(croppedBufR, targetRate, trackGain);
-    } else {
-      samples16R = new Int16Array(samples16);  // duplicate mono to R
-    }
-  }
-
-  // Max samples depends on device mode
-  const maxSamples = getMaxSamples();
-  if (samples16.length > maxSamples) {
-    setStatus(`Error: too many samples (${samples16.length} > ${maxSamples})`);
-    return;
-  }
-
-  // ADPCM encode
-  let encoded, blob;
-  if (deviceChannels === 2) {
-    encoded = adpcmEncodeStereo(samples16, samples16R);
-    blob = buildTrackBlob(encoded, speed.shift);
-  } else {
-    encoded = adpcmEncode(samples16);
-    blob = buildTrackBlob(encoded, speed.shift);
-  }
-
-  if (blob.length > MLR_TRACK_FLASH_SIZE) {
-    setStatus(`Error: data too large (${blob.length} > ${MLR_TRACK_FLASH_SIZE})`);
-    return;
-  }
-
-  setStatus(`Uploading track ${t + 1} (${blob.length} bytes)...`);
-  const pbar = document.getElementById(`pbar-${t}`);
   try {
-    await cmdWrite(t, blob, (pct) => { pbar.style.width = (pct * 100) + '%'; });
-    pbar.style.width = '100%';
-
-    // Update the UI from the exact blob we just wrote, instead of
-    // immediately re-reading the whole track back over serial.
-    if (previewState[t]) {
-      stopPreview(t, false);
-    }
-    const decoded = decodeTrackBlob(blob);
-    if (decoded) {
-      st.audioBuffer = decoded.audioBuf;
-      st.transients = detectTransients(decoded.audioBuf);
-      st.cropStart = 0;
-      st.cropEnd = decoded.audioBuf.length;
-      st.speedIdx = speedShiftToIdx(decoded.recordSpeedShift);
-      st.recordSpeedShift = decoded.recordSpeedShift;
-      document.getElementById(`speed-${t}`).value = st.speedIdx;
-      st.gain = 1.0;
-      document.getElementById(`gain-${t}`).value = 0;
-      document.getElementById(`gain-val-${t}`).textContent = '0 dB';
-      updateCropForSpeed(t);
-      drawWaveform(t);
-    }
+    // Channel 2 uses source channel 2 when present; mono files use their only
+    // channel for either output channel.
+    const sourceChannel = getSourceChannelIndex(st);
+    const recordedChannel = getRecordedChannel(t);
+    const prepared = prepareTrackUpload(st.audioBuffer, sourceChannel, speed, cropStart, cropEnd, gain, recordedChannel);
+    const result = await writePreparedTrack(t, prepared);
 
     // Refresh compact device metadata without blocking the UI.
     refreshInfo().catch(() => {});
-
-    const dur = (encoded.sampleCount / (48000 * speed.ratio)).toFixed(2);
-    setStatus(`Track ${t + 1} uploaded: ${dur}s, ${encoded.sampleCount} samples`);
-    document.getElementById(`info-${t}`).textContent =
-      `${encoded.sampleCount} samples (${(encoded.sampleCount / 48000).toFixed(2)}s at 1x), ${encoded.adpcmBytes.length} bytes, rec ${speedShiftToLabel(speed.shift)}`;
-    setTimeout(() => { pbar.style.width = '0%'; }, 2000);
+    setStatus(`Track ${t + 1} uploaded to channel ${recordedChannel + 1}: ${result.dur}s, ${result.encoded.sampleCount} samples`);
   } catch (e) {
     setStatus('Upload error: ' + e.message);
-    pbar.style.width = '0%';
+    const pbar = document.getElementById(`pbar-${t}`);
+    if (pbar) pbar.style.width = '0%';
   }
 }
 
-/** Encode an AudioBuffer (mono or stereo) as a 16-bit WAV blob */
+/** Encode an AudioBuffer as a 16-bit WAV blob. */
 function audioBufferToWavBlob(audioBuf) {
   const nCh = audioBuf.numberOfChannels;
   const numFrames = audioBuf.length;
@@ -1401,81 +1592,42 @@ function previewTrack(t, forceRestart = false) {
 
   const speed = SPEEDS[st.speedIdx];
   const targetRate = recTargetRate(speed);
-  const nCh = Math.min(st.audioBuffer.numberOfChannels, deviceChannels);
   const cropLen = st.cropEnd - st.cropStart;
   if (cropLen <= 0) { setStatus('No selection'); return; }
 
-  // Resample each channel to target rate
-  const resampled = [];
-  for (let ch = 0; ch < nCh; ch++) {
-    const srcData = st.audioBuffer.getChannelData(ch);
-    const cropped = srcData.slice(st.cropStart, st.cropEnd);
-    const croppedBuf = new AudioBuffer({
-      length: cropped.length,
-      sampleRate: st.audioBuffer.sampleRate,
-      numberOfChannels: 1
-    });
-    croppedBuf.getChannelData(0).set(cropped);
-    resampled.push(resampleBuffer(croppedBuf, targetRate, st.gain || 1.0));
-  }
+  const srcData = getSelectedChannelData(st);
+  const cropped = srcData.slice(st.cropStart, st.cropEnd);
+  const croppedBuf = new AudioBuffer({
+    length: cropped.length,
+    sampleRate: st.audioBuffer.sampleRate,
+    numberOfChannels: 1
+  });
+  croppedBuf.getChannelData(0).set(cropped);
+  const samples16 = resampleBuffer(croppedBuf, targetRate, st.gain || 1.0);
+  const enc = adpcmEncode(samples16);
 
-  // ADPCM encode → decode to preview codec artifacts
-  const decoded = [];
-  if (nCh >= 2) {
-    const enc = adpcmEncodeStereo(resampled[0], resampled[1]);
-    function decCh(getNyb, count) {
-      let pred = 0, si = 0;
-      const out = new Float32Array(count);
-      for (let i = 0; i < count; i++) {
-        const n = getNyb(i);
-        const step = IMA_STEP_TABLE[si];
-        let d = step >> 3;
-        if (n & 4) d += step; if (n & 2) d += step >> 1; if (n & 1) d += step >> 2;
-        pred += (n & 8) ? -d : d;
-        if (pred > 32767) pred = 32767; if (pred < -32768) pred = -32768;
-        si += IMA_INDEX_TABLE[n & 0xF];
-        if (si < 0) si = 0; if (si > 88) si = 88;
-        out[i] = pred / 32768;
-      }
-      return out;
-    }
-    const decM = decCh(i => enc.adpcmBytes[i] & 0xF, enc.sampleCount);
-    const decS = decCh(i => enc.adpcmBytes[i] >> 4, enc.sampleCount);
-    // M/S → L/R reconstruction
-    const decL = new Float32Array(enc.sampleCount);
-    const decR = new Float32Array(enc.sampleCount);
-    for (let i = 0; i < enc.sampleCount; i++) {
-      decL[i] = decM[i] + decS[i];
-      decR[i] = decM[i] - decS[i];
-    }
-    decoded.push(decL);
-    decoded.push(decR);
-  } else {
-    const enc = adpcmEncode(resampled[0]);
-    let pred = 0, si = 0;
-    const out = new Float32Array(enc.sampleCount);
-    let bi = 0, hi = false;
-    for (let i = 0; i < enc.sampleCount; i++) {
-      const b = enc.adpcmBytes[bi];
-      const n = hi ? (b >> 4) : (b & 0xF);
-      const step = IMA_STEP_TABLE[si];
-      let d = step >> 3;
-      if (n & 4) d += step; if (n & 2) d += step >> 1; if (n & 1) d += step >> 2;
-      pred += (n & 8) ? -d : d;
-      if (pred > 32767) pred = 32767; if (pred < -32768) pred = -32768;
-      si += IMA_INDEX_TABLE[n & 0xF];
-      if (si < 0) si = 0; if (si > 88) si = 88;
-      out[i] = pred / 32768;
-      if (hi) { bi++; hi = false; } else { hi = true; }
-    }
-    decoded.push(out);
+  let pred = 0, si = 0;
+  const decoded = new Float32Array(enc.sampleCount);
+  let bi = 0, hi = false;
+  for (let i = 0; i < enc.sampleCount; i++) {
+    const b = enc.adpcmBytes[bi];
+    const n = hi ? (b >> 4) : (b & 0xF);
+    const step = IMA_STEP_TABLE[si];
+    let d = step >> 3;
+    if (n & 4) d += step; if (n & 2) d += step >> 1; if (n & 1) d += step >> 2;
+    pred += (n & 8) ? -d : d;
+    if (pred > 32767) pred = 32767; if (pred < -32768) pred = -32768;
+    si += IMA_INDEX_TABLE[n & 0xF];
+    if (si < 0) si = 0; if (si > 88) si = 88;
+    decoded[i] = pred / 32768;
+    if (hi) { bi++; hi = false; } else { hi = true; }
   }
 
   // Play at the TARGET rate so pitch matches the original
-  const numFrames = decoded[0].length;
+  const numFrames = decoded.length;
   const actx = new AudioContext({ sampleRate: Math.round(targetRate) });
-  const buf = actx.createBuffer(decoded.length, numFrames, Math.round(targetRate));
-  for (let ch = 0; ch < decoded.length; ch++) buf.getChannelData(ch).set(decoded[ch]);
+  const buf = actx.createBuffer(1, numFrames, Math.round(targetRate));
+  buf.getChannelData(0).set(decoded);
   const src = actx.createBufferSource();
   src.buffer = buf;
   src.connect(actx.destination);
@@ -1512,7 +1664,7 @@ function previewTrack(t, forceRestart = false) {
     if (progress < 1) requestAnimationFrame(animatePlayhead);
   }
   requestAnimationFrame(animatePlayhead);
-  setStatus(`Preview: ${duration.toFixed(2)}s, ${decoded.length}ch, ADPCM at ${Math.round(targetRate)}Hz (${speed.name}, rec ${speedShiftToLabel(st.recordSpeedShift ?? 0)})`);
+  setStatus(`Preview ch ${getRecordedChannel(t) + 1}: ${duration.toFixed(2)}s, ADPCM at ${Math.round(targetRate)}Hz (${speed.name}, rec ${speedShiftToLabel(st.recordSpeedShift ?? 0)})`);
 }
 
 async function refreshInfo() {
@@ -1521,10 +1673,16 @@ async function refreshInfo() {
     const tracks = await cmdInfo();
     for (const t of tracks) {
       const el = document.getElementById(`info-${t.index}`);
+      if (trackState[t.index] && t.recordedChannel !== null) {
+        trackState[t.index].recordedChannel = t.recordedChannel;
+        const chSel = document.getElementById(`channel-${t.index}`);
+        if (chSel) chSel.value = t.recordedChannel;
+      }
       if (t.sampleCount > 0) {
         const dur = (t.sampleCount / 48000).toFixed(2);
         const spd = speedShiftToLabel(t.recordSpeedShift);
-        el.textContent = `${t.sampleCount} samples (${dur}s at 1x), ${t.adpcmBytes} bytes, rec ${spd}`;
+        const ch = trackState[t.index] ? getRecordedChannel(t.index) : (t.recordedChannel || 0);
+        el.textContent = `${t.sampleCount} samples (${dur}s at 1x), ${t.adpcmBytes} bytes, rec ${spd}, ch ${ch + 1}`;
       } else {
         el.textContent = 'empty';
       }
@@ -1536,69 +1694,42 @@ async function refreshInfo() {
   }
 }
 
-/** Decode a track blob (header + ADPCM) into an AudioBuffer.
- *  Returns { audioBuf, recordSpeedShift } or null if invalid.
- *  Uses deviceChannels to determine mono (2 samples/byte) or stereo (1 frame/byte). */
+/** Decode an MLR4 track blob (header + mono ADPCM) into an AudioBuffer. */
 function decodeTrackBlob(data) {
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const magic = dv.getUint32(0, true);
-  if (magic !== getMLRMagic()) return null;
+  if (magic !== MLR_MAGIC) return null;
 
   const sampleCount = dv.getUint32(4, true);
   const adpcmBytes = dv.getUint32(8, true);
   const recordSpeedShift = dv.getInt8(16);
+  const recordedChannel = dv.getUint8(17) & 0x01;
   if (sampleCount === 0) return null;
 
   const adpcmData = data.slice(MLR_HEADER_SIZE, MLR_HEADER_SIZE + adpcmBytes);
-  const nCh = deviceChannels;
   const storedSampleRate = Math.max(3000, Math.round(48000 * speedShiftToRatio(recordSpeedShift)));
 
-  function decodeChannel(getNybble, count) {
-    let predictor = 0, stepIndex = 0;
-    const pcm = new Float32Array(count);
-    for (let i = 0; i < count; i++) {
-      const nybble = getNybble(i);
-      const step = IMA_STEP_TABLE[stepIndex];
-      let delta = step >> 3;
-      if (nybble & 4) delta += step;
-      if (nybble & 2) delta += step >> 1;
-      if (nybble & 1) delta += step >> 2;
-      predictor += (nybble & 8) ? -delta : delta;
-      if (predictor > 32767) predictor = 32767;
-      if (predictor < -32768) predictor = -32768;
-      stepIndex += IMA_INDEX_TABLE[nybble & 0xF];
-      if (stepIndex < 0) stepIndex = 0;
-      if (stepIndex > 88) stepIndex = 88;
-      pcm[i] = predictor / 32768;
-    }
-    return pcm;
+  let predictor = 0, stepIndex = 0;
+  const pcm = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    const b = adpcmData[i >> 1];
+    const nybble = (i & 1) ? (b >> 4) : (b & 0xF);
+    const step = IMA_STEP_TABLE[stepIndex];
+    let delta = step >> 3;
+    if (nybble & 4) delta += step;
+    if (nybble & 2) delta += step >> 1;
+    if (nybble & 1) delta += step >> 2;
+    predictor += (nybble & 8) ? -delta : delta;
+    if (predictor > 32767) predictor = 32767;
+    if (predictor < -32768) predictor = -32768;
+    stepIndex += IMA_INDEX_TABLE[nybble & 0xF];
+    if (stepIndex < 0) stepIndex = 0;
+    if (stepIndex > 88) stepIndex = 88;
+    pcm[i] = predictor / 32768;
   }
-
-  if (nCh === 2) {
-    // Stereo M/S: low nybble = Mid, high nybble = Side
-    const pcmM = decodeChannel((i) => adpcmData[i] & 0xF, sampleCount);
-    const pcmS = decodeChannel((i) => adpcmData[i] >> 4, sampleCount);
-    // M/S → L/R reconstruction
-    const pcmL = new Float32Array(sampleCount);
-    const pcmR = new Float32Array(sampleCount);
-    for (let i = 0; i < sampleCount; i++) {
-      pcmL[i] = pcmM[i] + pcmS[i];
-      pcmR[i] = pcmM[i] - pcmS[i];
-    }
-    const buf = new AudioBuffer({ length: sampleCount, sampleRate: storedSampleRate, numberOfChannels: 2 });
-    buf.getChannelData(0).set(pcmL);
-    buf.getChannelData(1).set(pcmR);
-    return { audioBuf: buf, recordSpeedShift };
-  } else {
-    // Mono: 2 nybbles per byte, low first then high
-    const pcm = decodeChannel((i) => {
-      const b = adpcmData[i >> 1];
-      return (i & 1) ? (b >> 4) : (b & 0xF);
-    }, sampleCount);
-    const buf = new AudioBuffer({ length: sampleCount, sampleRate: storedSampleRate, numberOfChannels: 1 });
-    buf.getChannelData(0).set(pcm);
-    return { audioBuf: buf, recordSpeedShift };
-  }
+  const buf = new AudioBuffer({ length: sampleCount, sampleRate: storedSampleRate, numberOfChannels: 1 });
+  buf.getChannelData(0).set(pcm);
+  return { audioBuf: buf, recordSpeedShift, recordedChannel };
 }
 
 /** Read all tracks from device and populate waveform displays */
@@ -1611,6 +1742,11 @@ async function readAllTracks() {
   for (let t = 0; t < MLR_NUM_TRACKS; t++) {
     const info = trackInfo[t];
     if (!info || info.sampleCount === 0) {
+      if (info && info.recordedChannel !== null) {
+        trackState[t].recordedChannel = info.recordedChannel;
+        const chSel = document.getElementById(`channel-${t}`);
+        if (chSel) chSel.value = info.recordedChannel;
+      }
       trackState[t].audioBuffer = null;
       trackState[t].cropStart = 0;
       trackState[t].cropEnd = 0;
@@ -1623,17 +1759,31 @@ async function readAllTracks() {
     setStatus(`Reading track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})...`);
     await yieldToUi();
     let data = null;
+    let lastProgressTime = 0;
+    let lastProgressPercent = -1;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        data = await cmdRead(t, (pct) => {
+        data = await cmdRead(t, (pct, received, totalLen) => {
           const percent = Math.round(pct * 100);
-          setStatus(`Reading track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})... ${percent}%`);
+          const now = Date.now();
+          if (percent !== lastProgressPercent && (percent === 100 || now - lastProgressTime >= 150)) {
+            lastProgressTime = now;
+            lastProgressPercent = percent;
+            if (percent % 10 === 0 || percent === 100) {
+              console.debug(`Track ${t + 1} read progress: ${received}/${totalLen} bytes (${percent}%)`);
+            }
+            setStatus(`Reading track ${t + 1} (${nonEmptyIndex} of ${nonEmptyTracks.length})... ${percent}%`);
+          }
         });
         break;
       } catch (e) {
+        console.warn(`Track ${t + 1} read attempt ${attempt + 1}/3 failed:`, e);
         if (attempt < 2) {
-          setStatus(`Track ${t + 1} busy, retrying...`);
+          setStatus(`Track ${t + 1} read interrupted, retrying...`);
           await new Promise(r => setTimeout(r, 500));
+        } else {
+          console.error(`Track ${t + 1} read failed after 3 attempts:`, e);
+          throw e;
         }
       }
     }
@@ -1652,8 +1802,11 @@ async function readAllTracks() {
         trackState[t].cropStart = 0;
         trackState[t].cropEnd = decoded.audioBuf.length;
         trackState[t].speedIdx = speedShiftToIdx(decoded.recordSpeedShift);
+        trackState[t].recordSpeedShift = decoded.recordSpeedShift;
+        trackState[t].recordedChannel = decoded.recordedChannel;
         trackState[t].gain = 1.0;
         document.getElementById(`speed-${t}`).value = trackState[t].speedIdx;
+        document.getElementById(`channel-${t}`).value = trackState[t].recordedChannel;
         document.getElementById(`gain-${t}`).value = 0;
         document.getElementById(`gain-val-${t}`).textContent = '0 dB';
         updateCropForSpeed(t);
@@ -1665,14 +1818,13 @@ async function readAllTracks() {
     drawWaveform(t);
     await yieldToUi();
   }
-  setStatus(`All tracks loaded (${deviceChannels === 2 ? 'stereo' : 'mono'})`);
+  setStatus('All tracks loaded');
 }
 
-/** Update speed dropdowns and heading after device mode is known */
+/** Update speed dropdowns and heading after connection. */
 function updateUIForDeviceMode() {
-  const mode = deviceChannels === 2 ? 'stereo' : 'mono';
-  document.querySelector('h1').textContent = `MLRws Sample Manager (${mode})`;
-  document.title = `MLRws Sample Manager (${mode})`;
+  document.querySelector('h1').textContent = 'MLRws Sample Manager';
+  document.title = 'MLRws Sample Manager';
   for (let t = 0; t < MLR_NUM_TRACKS; t++) {
     const sel = document.getElementById(`speed-${t}`);
     if (!sel) continue;
@@ -1689,13 +1841,16 @@ function updateUIForDeviceMode() {
 // ---- Init ----
 document.getElementById('connect-btn').addEventListener('click', async () => {
   if (isSerialConnected()) {
-    await serialDisconnect();
+    await manualSerialDisconnect();
     return;
   }
 
   try {
+    isManualDisconnect = false;
+    clearAutoReconnectTimer();
     await serialConnect();
     await initialiseDeviceConnection();
+    await rememberConnectedPort();
   } catch (e) {
     if (port || reader || writer) {
       await serialDisconnect(false);
@@ -1720,8 +1875,20 @@ document.addEventListener('drop', (e) => {
 });
 
 if (navigator.serial && typeof navigator.serial.addEventListener === 'function') {
+  navigator.serial.addEventListener('connect', (event) => {
+    if (!autoReconnectEnabled || isSerialConnected() || !selectedPort) return;
+
+    const eventPort = event?.port || event?.target;
+    if (eventPort && !isSamePort(eventPort, selectedPort, selectedPortInfo)) return;
+
+    scheduleAutoReconnect(150);
+  });
+
   navigator.serial.addEventListener('disconnect', async (event) => {
-    if (event.target === port) {
+    const eventPort = event?.port || event?.target;
+    if (eventPort && selectedPort && !isSamePort(eventPort, selectedPort, selectedPortInfo)) return;
+
+    if (!eventPort || eventPort === port || isSamePort(eventPort, port, selectedPortInfo)) {
       await handleUnexpectedDisconnect('Device disconnected');
     }
   });

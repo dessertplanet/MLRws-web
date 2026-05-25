@@ -210,6 +210,8 @@ let autoReconnectTimer = null;
 let isManualDisconnect = false;
 let reconnectInProgress = false;
 const reconnectDelayMs = 900;
+const READ_CHUNK_SIZE = 1024;
+const READ_CHUNK_ACK = 0x41; // 'A'
 
 function notifyReadBufferWaiters() {
   if (readBufferWaiters.length === 0) return;
@@ -580,7 +582,7 @@ async function initialiseDeviceConnection() {
       setStatus('Waking sample manager...');
       await requireInitialSync();
       setStatus('Reading device metadata...');
-      await refreshInfo();
+      await refreshInfo({ skipSync: true });
       updateUIForDeviceMode();
       setStatus('Loading tracks from device...');
       await readAllTracks();
@@ -602,27 +604,33 @@ async function initialiseDeviceConnection() {
 let deviceTrackInfo = [];
 
 // ---- Track commands ----
-async function cmdInfo() {
-  await cmdSync();
+async function cmdInfo(options = {}) {
+  const { skipSync = false } = options;
+  if (!skipSync) await cmdSync();
   await serialWrite('I');
-  let header;
+
+  let infoBytes;
   try {
-    header = await waitForLine(2500);
+    const lenBytes = await waitForBytes(4, 2500);
+    const infoLen = new DataView(lenBytes.buffer, lenBytes.byteOffset, 4).getUint32(0, true);
+    if (infoLen === 0 || infoLen > 512) throw new Error('Invalid metadata length: ' + infoLen);
+    infoBytes = await waitForBytes(infoLen, 2500);
   } catch (e) {
-    throw new Error('Timed out waiting for metadata header');
+    throw new Error('Timed out waiting for metadata frame');
   }
+
+  const lines = new TextDecoder().decode(infoBytes).trim().split('\n');
+  const header = lines.shift() || '';
   const headerParts = header.split(' ');
   if (headerParts[0] !== 'MLR1') throw new Error('Bad info response: ' + header);
 
   const tracks = [];
-  while (true) {
-    let line;
-    try {
-      line = await waitForLine(2500);
-    } catch (e) {
-      throw new Error(`Timed out waiting for metadata line ${tracks.length + 1}`);
+  let sawEnd = false;
+  for (const line of lines) {
+    if (line === 'END') {
+      sawEnd = true;
+      break;
     }
-    if (line === 'END') break;
 
     const parts = line.split(' ');
     if (!/^T\d+$/.test(parts[0]) || parts.length < 4) {
@@ -637,6 +645,10 @@ async function cmdInfo() {
       recordSpeedShift: parts.length > 4 ? parseInt(parts[4], 10) : 0,
       recordedChannel: parts.length > 5 ? (parseInt(parts[5], 10) & 0x01) : null,
     });
+  }
+
+  if (!sawEnd) {
+    throw new Error('Metadata frame missing END');
   }
 
   deviceTrackInfo = tracks;
@@ -704,9 +716,9 @@ async function cmdRead(track, progressCb) {
 
   const data = new Uint8Array(totalLen);
   let received = 0;
+  let nextAckAt = Math.min(READ_CHUNK_SIZE, totalLen);
   const deadline = Date.now() + 60000;
   let idleDeadline = Date.now() + 15000;
-  let recoveredShortTail = false;
   while (received < totalLen) {
     if (Date.now() > deadline) {
       throw new Error(`Timeout waiting for track ${track + 1} data (${received}/${totalLen} bytes)`);
@@ -719,27 +731,11 @@ async function cmdRead(track, progressCb) {
       }
       const idleRemaining = idleDeadline - Date.now();
       if (idleRemaining <= 0) {
-        const missing = totalLen - received;
-        if (missing > 0 && missing <= 64) {
-          data.fill(0xFF, received);
-          console.warn(`Recovered short tail while reading track ${track + 1}; padded ${missing} missing byte(s)`);
-          received = totalLen;
-          recoveredShortTail = true;
-          break;
-        }
         throw new Error(`Stalled reading track ${track + 1} data (${received}/${totalLen} bytes)`);
       }
       try {
         await waitForIncomingData(Math.min(remaining, idleRemaining));
       } catch (_) {
-        const missing = totalLen - received;
-        if (missing > 0 && missing <= 64) {
-          data.fill(0xFF, received);
-          console.warn(`Recovered short tail while reading track ${track + 1}; padded ${missing} missing byte(s)`);
-          received = totalLen;
-          recoveredShortTail = true;
-          break;
-        }
         throw new Error(`Stalled reading track ${track + 1} data (${received}/${totalLen} bytes)`);
       }
       continue;
@@ -751,19 +747,23 @@ async function cmdRead(track, progressCb) {
     received += chunk;
     idleDeadline = Date.now() + 15000;
 
+    while (received >= nextAckAt) {
+      await serialWrite(new Uint8Array([READ_CHUNK_ACK]));
+      if (nextAckAt >= totalLen) break;
+      nextAckAt = Math.min(nextAckAt + READ_CHUNK_SIZE, totalLen);
+    }
+
     if (progressCb) progressCb(received / totalLen, received, totalLen);
   }
 
   // Verify end-of-stream marker from firmware
-  if (!recoveredShortTail) {
-    try {
-      const doneLine = await waitForLine(5000);
-      if (doneLine !== 'DONE') {
-        console.warn('Expected DONE after read, got:', doneLine);
-      }
-    } catch (_) {
-      console.warn('No DONE marker received after read (old firmware?)');
+  try {
+    const doneLine = await waitForLine(5000);
+    if (doneLine !== 'DONE') {
+      console.warn('Expected DONE after read, got:', doneLine);
     }
+  } catch (_) {
+    console.warn('No DONE marker received after read (old firmware?)');
   }
 
   await yieldToUi();
@@ -1667,10 +1667,10 @@ function previewTrack(t, forceRestart = false) {
   setStatus(`Preview ch ${getRecordedChannel(t) + 1}: ${duration.toFixed(2)}s, ADPCM at ${Math.round(targetRate)}Hz (${speed.name}, rec ${speedShiftToLabel(st.recordSpeedShift ?? 0)})`);
 }
 
-async function refreshInfo() {
+async function refreshInfo(options = {}) {
   if (!port) return;
   try {
-    const tracks = await cmdInfo();
+    const tracks = await cmdInfo(options);
     for (const t of tracks) {
       const el = document.getElementById(`info-${t.index}`);
       if (trackState[t.index] && t.recordedChannel !== null) {

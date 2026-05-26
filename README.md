@@ -1,0 +1,1 @@
+A web app companion to [MLRws](https://github.com/TomWhitwell/Workshop_Computer/tree/main/releases/15_MLRws#readme). Full web app docs [here](https://github.com/TomWhitwell/Workshop_Computer/blob/main/releases/15_MLRws/docs/SampleMgr.md)

@@ -108,7 +108,7 @@ function adpcmEncode(samples16) {
   return { adpcmBytes: adpcmBytes.slice(0, Math.ceil(nSamples / 2)), keyframes, sampleCount: nSamples };
 }
 
-function buildTrackBlob(encoded, recordSpeedShift = 0, recordedChannel = 0, cv1PitchEnabled = true) {
+function buildTrackBlob(encoded, recordSpeedShift = 0, recordedChannel = 0, cv1PitchEnabled = false) {
   const { adpcmBytes, keyframes, sampleCount } = encoded;
   const headerBuf = new ArrayBuffer(MLR_HEADER_SIZE);
   const hdr = new DataView(headerBuf);
@@ -250,7 +250,9 @@ function updateConnectButton() {
 
   for (let t = 0; t < MLR_NUM_TRACKS; t++) {
     const cvSel = document.getElementById(`cv1pitch-${t}`);
-    if (cvSel) cvSel.disabled = !connected;
+    const info = getDeviceTrackInfo(t);
+    const hasContent = !!(info && info.sampleCount > 0);
+    if (cvSel) cvSel.disabled = !connected || !hasContent;
   }
 }
 
@@ -361,7 +363,7 @@ function clearDeviceVisualsAndBuffers() {
       st.cropStart = 0;
       st.cropEnd = 0;
       st.recordSpeedShift = 0;
-      st.cv1PitchEnabled = true;
+      st.cv1PitchEnabled = false;
     }
 
     const info = document.getElementById(`info-${t}`);
@@ -374,7 +376,7 @@ function clearDeviceVisualsAndBuffers() {
     if (fileInput) fileInput.value = '';
 
     const cvSel = document.getElementById(`cv1pitch-${t}`);
-    if (cvSel) cvSel.checked = true;
+    if (cvSel) cvSel.checked = false;
 
     const ph = document.getElementById(`playhead-${t}`);
     if (ph) ph.style.display = 'none';
@@ -710,7 +712,7 @@ async function cmdSetCv1Pitch(track, enabled) {
   await cmdSync();
   await serialWrite(new Uint8Array([0x50, track, enabled ? 1 : 0])); // 'P' + track + enabled
   const resp = await waitForLine();
-  if (resp !== 'OK') throw new Error('CV1 pitch update failed: ' + resp);
+  if (resp !== 'OK') throw new Error('CV output update failed: ' + resp);
 }
 
 async function syncCv1PitchSetting(track, enabled) {
@@ -725,7 +727,7 @@ async function syncCv1PitchSetting(track, enabled) {
       return;
     } catch (err) {
       lastError = err;
-      console.warn(`CV1 pitch metadata sync attempt ${attempt + 1}/5 failed:`, err);
+      console.warn(`CV output metadata sync attempt ${attempt + 1}/5 failed:`, err);
       readBuffer = new Uint8Array(0);
       if (attempt < 4) {
         await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
@@ -894,7 +896,7 @@ function createTrackUI() {
       speedIdx: 3, // normal
       recordSpeedShift: 0,
       recordedChannel: 0,
-      cv1PitchEnabled: true,
+      cv1PitchEnabled: false,
     };
 
     const div = document.createElement('div');
@@ -914,7 +916,7 @@ function createTrackUI() {
           <option value="0" ${trackState[t].recordedChannel === 0 ? 'selected' : ''}>1</option>
           <option value="1" ${trackState[t].recordedChannel === 1 ? 'selected' : ''}>2</option>
         </select>
-        <label class="control-label">CV1 pitch:</label>
+        <label class="control-label">CV output:</label>
         <input type="checkbox" id="cv1pitch-${t}" ${trackState[t].cv1PitchEnabled ? 'checked' : ''}>
         <span id="info-${t}" class="track-info">empty</span>
       </div>
@@ -969,6 +971,7 @@ function createTrackUI() {
     });
 
     document.getElementById(`cv1pitch-${t}`).addEventListener('change', async (e) => {
+      if (e.target.disabled) return;
       const enabled = !!e.target.checked;
       trackState[t].cv1PitchEnabled = enabled;
       if (port) {
@@ -977,7 +980,7 @@ function createTrackUI() {
         } catch (err) {
           e.target.checked = !enabled;
           trackState[t].cv1PitchEnabled = !enabled;
-          setStatus('CV1 pitch update error: ' + err.message);
+          setStatus('CV output update error: ' + err.message);
         }
       }
     });
@@ -1462,7 +1465,7 @@ async function writePreparedTrack(t, prepared) {
 
   const dur = (encoded.sampleCount / (48000 * speed.ratio)).toFixed(2);
   document.getElementById(`info-${t}`).textContent =
-    `${encoded.sampleCount} samples (${(encoded.sampleCount / 48000).toFixed(2)}s at 1x), ${encoded.adpcmBytes.length} bytes, rec ${speedShiftToLabel(speed.shift)}, ch ${recordedChannel + 1}, cv1 ${cv1PitchEnabled ? 'on' : 'off'}`;
+    `${encoded.sampleCount} samples (${(encoded.sampleCount / 48000).toFixed(2)}s at 1x), ${encoded.adpcmBytes.length} bytes, rec ${speedShiftToLabel(speed.shift)}, ch ${recordedChannel + 1}, cv ${cv1PitchEnabled ? 'on' : 'off'}`;
   setTimeout(() => { pbar.style.width = '0%'; }, 2000);
   return { dur, encoded };
 }
@@ -1482,7 +1485,10 @@ async function uploadTrack(t) {
     // channel for either output channel.
     const sourceChannel = getSourceChannelIndex(st);
     const recordedChannel = getRecordedChannel(t);
-    const prepared = prepareTrackUpload(st.audioBuffer, sourceChannel, speed, cropStart, cropEnd, recordedChannel, st.cv1PitchEnabled !== false);
+    const info = getDeviceTrackInfo(t);
+    const hadContent = !!(info && info.sampleCount > 0);
+    const cv1PitchEnabled = hadContent ? (st.cv1PitchEnabled === true) : false;
+    const prepared = prepareTrackUpload(st.audioBuffer, sourceChannel, speed, cropStart, cropEnd, recordedChannel, cv1PitchEnabled);
     const result = await writePreparedTrack(t, prepared);
 
     // Refresh compact device metadata without blocking the UI.
@@ -1565,10 +1571,11 @@ async function eraseTrack(t) {
     trackState[t].cropStart = 0;
     trackState[t].cropEnd = 0;
     trackState[t].transients = [];
-    trackState[t].cv1PitchEnabled = true;
+    trackState[t].cv1PitchEnabled = false;
     drawWaveform(t);
     document.getElementById(`info-${t}`).textContent = 'empty';
-    document.getElementById(`cv1pitch-${t}`).checked = true;
+    document.getElementById(`cv1pitch-${t}`).checked = false;
+    updateConnectButton();
     setStatus(`Track ${t + 1} cleared`);
   } catch (e) {
     setStatus('Erase error: ' + e.message);
@@ -1716,12 +1723,13 @@ async function refreshInfo(options = {}) {
         const dur = (t.sampleCount / 48000).toFixed(2);
         const spd = speedShiftToLabel(t.recordSpeedShift);
         const ch = trackState[t.index] ? getRecordedChannel(t.index) : (t.recordedChannel || 0);
-        const cv1 = t.cv1PitchEnabled === false ? 'off' : 'on';
-        el.textContent = `${t.sampleCount} samples (${dur}s at 1x), ${t.adpcmBytes} bytes, rec ${spd}, ch ${ch + 1}, cv1 ${cv1}`;
+        const cv = t.cv1PitchEnabled === false ? 'off' : 'on';
+        el.textContent = `${t.sampleCount} samples (${dur}s at 1x), ${t.adpcmBytes} bytes, rec ${spd}, ch ${ch + 1}, cv ${cv}`;
       } else {
         el.textContent = 'empty';
       }
     }
+    updateConnectButton();
     return tracks;
   } catch (e) {
     if (!quietErrors) setStatus('Info error: ' + e.message);

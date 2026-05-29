@@ -25,6 +25,7 @@ h1 { margin-bottom: 10px; }
 .crop-region { position: absolute; top: 0; height: 100%; background: rgba(0,0,255,0.1); pointer-events: none; }
 .playhead { position: absolute; top: 0; width: 2px; height: 100%; background: #00cc00; pointer-events: none; display: none; }
 #connect-btn { font-family: monospace; font-size: 14px; padding: 6px 16px; cursor: pointer; margin-bottom: 10px; }
+#firmware-version { position: fixed; right: 12px; bottom: 10px; color: #666; font-size: 12px; background: rgba(255,255,255,0.88); padding: 3px 6px; pointer-events: none; }
 .progress { height: 4px; background: #eee; margin-top: 4px; }
 .progress-bar { height: 100%; background: #333; width: 0%; transition: width 0.1s; }
 </style>
@@ -34,6 +35,7 @@ h1 { margin-bottom: 10px; }
 <button id="connect-btn">Connect</button>
 <div id="status">Not connected</div>
 <div id="tracks"></div>
+<div id="firmware-version">Firmware: --</div>
 
 <script src="MLRws.js"></script>
 </body>

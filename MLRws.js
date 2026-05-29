@@ -211,6 +211,7 @@ let autoReconnectEnabled = false;
 let autoReconnectTimer = null;
 let isManualDisconnect = false;
 let reconnectInProgress = false;
+let firmwareVersion = null;
 const reconnectDelayMs = 900;
 const READ_CHUNK_SIZE = 1024;
 const READ_CHUNK_ACK = 0x41; // 'A'
@@ -321,7 +322,9 @@ async function serialDisconnect(showStatusMessage = true) {
   reader = null;
   writer = null;
   readBuffer = new Uint8Array(0);
+  firmwareVersion = null;
   notifyReadBufferWaiters();
+  updateFirmwareVersionLabel();
   updateConnectButton();
 
   try {
@@ -669,6 +672,13 @@ async function cmdInfo(options = {}) {
   const headerParts = header.split(' ');
   if (headerParts[0] !== 'MLR1') throw new Error('Bad info response: ' + header);
 
+  firmwareVersion = '1.0';
+  const firmwareTokenIndex = headerParts.indexOf('FW');
+  if (firmwareTokenIndex >= 0 && headerParts[firmwareTokenIndex + 1]) {
+    firmwareVersion = headerParts[firmwareTokenIndex + 1];
+  }
+  updateFirmwareVersionLabel();
+
   const tracks = [];
   let sawEnd = false;
   for (const line of lines) {
@@ -847,6 +857,11 @@ async function cmdRead(track, progressCb) {
 }
 
 // ---- UI ----
+function updateFirmwareVersionLabel() {
+  const el = document.getElementById('firmware-version');
+  if (el) el.textContent = `Firmware: ${firmwareVersion || '--'}`;
+}
+
 function setStatus(msg) {
   document.getElementById('status').textContent = msg;
 }

@@ -9,6 +9,7 @@
 body { font-family: monospace; font-size: 14px; padding: 20px; max-width: 900px; margin: 0 auto; }
 h1 { margin-bottom: 10px; }
 #status { margin: 10px 0; padding: 8px; border: 1px solid #ccc; }
+#status.error { border-color: #b00020; color: #b00020; }
 .track { border: 1px solid #ccc; margin: 8px 0; padding: 10px; }
 .track.drag-over { border-color: #1f6feb; background: rgba(31,111,235,0.06); }
 .track-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
@@ -25,6 +26,7 @@ h1 { margin-bottom: 10px; }
 .crop-region { position: absolute; top: 0; height: 100%; background: rgba(0,0,255,0.1); pointer-events: none; }
 .playhead { position: absolute; top: 0; width: 2px; height: 100%; background: #00cc00; pointer-events: none; display: none; }
 #connect-btn { font-family: monospace; font-size: 14px; padding: 6px 16px; cursor: pointer; margin-bottom: 10px; }
+#connect-btn:disabled { cursor: not-allowed; opacity: 0.55; }
 #firmware-version { position: fixed; right: 12px; bottom: 10px; color: #666; font-size: 12px; background: rgba(255,255,255,0.88); padding: 3px 6px; pointer-events: none; }
 .progress { height: 4px; background: #eee; margin-top: 4px; }
 .progress-bar { height: 100%; background: #333; width: 0%; transition: width 0.1s; }

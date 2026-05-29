@@ -857,13 +857,32 @@ async function cmdRead(track, progressCb) {
 }
 
 // ---- UI ----
+function setUnsupportedBrowserError(message) {
+  const status = document.getElementById('status');
+  if (status) {
+    status.textContent = message;
+    status.classList.add('error');
+  }
+
+  const btn = document.getElementById('connect-btn');
+  if (btn) btn.disabled = true;
+}
+
+function assertSupportedBrowser() {
+  if (!('serial' in navigator)) {
+    throw new Error('Unsupported browser: Web Serial is required. Use Chrome, Edge, Brave, or another Chromium-based browser.');
+  }
+}
+
 function updateFirmwareVersionLabel() {
   const el = document.getElementById('firmware-version');
   if (el) el.textContent = `Firmware: ${firmwareVersion || '--'}`;
 }
 
 function setStatus(msg) {
-  document.getElementById('status').textContent = msg;
+  const status = document.getElementById('status');
+  status.textContent = msg;
+  status.classList.remove('error');
 }
 
 const trackState = [];
@@ -1900,7 +1919,18 @@ function updateUIForDeviceMode() {
 }
 
 // ---- Init ----
+let browserSupported = true;
+try {
+  assertSupportedBrowser();
+} catch (e) {
+  browserSupported = false;
+  setUnsupportedBrowserError(e.message);
+  console.error(e);
+}
+
 document.getElementById('connect-btn').addEventListener('click', async () => {
+  if (!browserSupported) return;
+
   if (isSerialConnected()) {
     await manualSerialDisconnect();
     return;

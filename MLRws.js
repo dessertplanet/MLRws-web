@@ -950,7 +950,7 @@ function createTrackUI() {
           <option value="0" ${trackState[t].recordedChannel === 0 ? 'selected' : ''}>1</option>
           <option value="1" ${trackState[t].recordedChannel === 1 ? 'selected' : ''}>2</option>
         </select>
-        <label class="control-label">CV output:</label>
+        <label class="control-label">CV/pulse outputs:</label>
         <input type="checkbox" id="cv1pitch-${t}" ${trackState[t].cv1PitchEnabled ? 'checked' : ''}>
         <span id="info-${t}" class="track-info">empty</span>
       </div>

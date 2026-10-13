@@ -27,6 +27,10 @@ h1 { margin-bottom: 10px; }
 .playhead { position: absolute; top: 0; width: 2px; height: 100%; background: #00cc00; pointer-events: none; display: none; }
 #connect-btn { font-family: monospace; font-size: 14px; padding: 6px 16px; cursor: pointer; margin-bottom: 10px; }
 #connect-btn:disabled { cursor: not-allowed; opacity: 0.55; }
+#card-settings { margin: 10px 0; padding: 8px; border: 1px solid #ccc; display: flex; align-items: center; gap: 10px; }
+#card-settings[hidden] { display: none; }
+#card-settings input[type=range] { flex: 1; max-width: 300px; }
+#card-settings .hint { font-size: 11px; color: #666; }
 #firmware-version { position: fixed; right: 12px; bottom: 10px; color: #666; font-size: 12px; background: rgba(255,255,255,0.88); padding: 3px 6px; pointer-events: none; }
 .progress { height: 4px; background: #eee; margin-top: 4px; }
 .progress-bar { height: 100%; background: #333; width: 0%; transition: width 0.1s; }
@@ -36,6 +40,12 @@ h1 { margin-bottom: 10px; }
 <h1>MLRws Sample Manager</h1>
 <button id="connect-btn">Connect</button>
 <div id="status">Not connected</div>
+<div id="card-settings" hidden>
+  <label for="rot-range">CV In 2 rotation range</label>
+  <input type="range" id="rot-range" min="1" max="100" value="100">
+  <span id="rot-range-val">100%</span>
+  <span class="hint">share of the track +5 V rotates by</span>
+</div>
 <div id="tracks"></div>
 <div id="firmware-version">Firmware: --</div>
 

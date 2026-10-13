@@ -241,6 +241,7 @@ let autoReconnectTimer = null;
 let isManualDisconnect = false;
 let reconnectInProgress = false;
 let firmwareVersion = null;
+let cardRotRange = null;  /* CV In 2 rotation range (%) reported by firmware 1.2.1+, else null */
 const reconnectDelayMs = 900;
 const READ_CHUNK_SIZE = 1024;
 const READ_CHUNK_ACK = 0x41; // 'A'
@@ -352,8 +353,10 @@ async function serialDisconnect(showStatusMessage = true) {
   writer = null;
   readBuffer = new Uint8Array(0);
   firmwareVersion = null;
+  cardRotRange = null;
   notifyReadBufferWaiters();
   updateFirmwareVersionLabel();
+  updateCardSettingsUI();
   updateConnectButton();
 
   try {
@@ -706,7 +709,10 @@ async function cmdInfo(options = {}) {
   if (firmwareTokenIndex >= 0 && headerParts[firmwareTokenIndex + 1]) {
     firmwareVersion = headerParts[firmwareTokenIndex + 1];
   }
+  const rotTokenIndex = headerParts.indexOf('ROT');
+  cardRotRange = rotTokenIndex >= 0 ? parseInt(headerParts[rotTokenIndex + 1], 10) || null : null;
   updateFirmwareVersionLabel();
+  updateCardSettingsUI();
   const newSampleRate = sampleRateForFirmware(firmwareVersion);
   if (newSampleRate !== cardSampleRate) {
     cardSampleRate = newSampleRate;
@@ -758,6 +764,44 @@ async function cmdSetCv1Pitch(track, enabled) {
   await serialWrite(new Uint8Array([0x50, track, enabled ? 1 : 0])); // 'P' + track + enabled
   const resp = await waitForLine();
   if (resp !== 'OK') throw new Error('CV output update failed: ' + resp);
+}
+
+/** 'G' + (0x80 | percent): card-wide CV In 2 rotation range (high bit keeps the
+ *  value byte from ever reading as the 'X' resync). */
+async function cmdSetRotRange(pct) {
+  await cmdSync();
+  await serialWrite(new Uint8Array([0x47, 0x80 | pct]));
+  const resp = await waitForLine();
+  if (resp !== 'OK') throw new Error('Rotation range update failed: ' + resp);
+}
+
+function updateCardSettingsUI() {
+  const box = document.getElementById('card-settings');
+  if (!box) return;
+  box.hidden = cardRotRange === null;
+  if (cardRotRange !== null) {
+    document.getElementById('rot-range').value = cardRotRange;
+    document.getElementById('rot-range-val').textContent = `${cardRotRange}%`;
+  }
+}
+
+async function syncRotRange(pct) {
+  let lastError = null;
+  setStatus('Saving rotation range...');
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await cmdSetRotRange(pct);
+      await refreshInfo({ quietErrors: true });
+      setStatus(`Rotation range set to ${pct}% (saved when the card leaves sample-manager mode)`);
+      return;
+    } catch (err) {
+      lastError = err;
+      console.warn(`Rotation range sync attempt ${attempt + 1}/5 failed:`, err);
+      readBuffer = new Uint8Array(0);
+      if (attempt < 4) await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  throw lastError || new Error('Rotation range sync failed');
 }
 
 async function syncCv1PitchSetting(track, enabled) {
@@ -1964,6 +2008,20 @@ try {
   setUnsupportedBrowserError(e.message);
   console.error(e);
 }
+
+document.getElementById('rot-range').addEventListener('input', (e) => {
+  document.getElementById('rot-range-val').textContent = `${e.target.value}%`;
+});
+document.getElementById('rot-range').addEventListener('change', async (e) => {
+  const pct = Math.max(1, Math.min(100, parseInt(e.target.value, 10) || 100));
+  if (!port || cardRotRange === null) return;
+  try {
+    await syncRotRange(pct);
+  } catch (err) {
+    setStatus('Rotation range error: ' + err.message);
+    updateCardSettingsUI();  // snap back to the card's value
+  }
+});
 
 document.getElementById('connect-btn').addEventListener('click', async () => {
   if (!browserSupported) return;

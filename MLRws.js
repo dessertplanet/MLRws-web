@@ -47,9 +47,27 @@ function speedShiftToIdx(shift) {
   if (shift > 0) shift = 0;  // clamp faster-than-1x to 1x
   return Math.max(0, Math.min(SPEEDS.length - 1, shift + 3));
 }
+/**
+ * Card audio sample rate. Firmware 1.2.0 and later runs at 24 kHz; earlier
+ * firmware runs at 48 kHz. Until a card reports its version, assume current
+ * firmware; after a disconnect, keep the last connected card's rate.
+ */
+const MLR_SAMPLE_RATE_LEGACY = 48000;
+const MLR_SAMPLE_RATE_CURRENT = 24000;
+let cardSampleRate = MLR_SAMPLE_RATE_CURRENT;
+function firmwareAtLeast(version, major, minor) {
+  const [maj = 0, min = 0] = String(version).split('.').map((n) => parseInt(n, 10) || 0);
+  return maj > major || (maj === major && min >= minor);
+}
+function sampleRateForFirmware(version) {
+  return firmwareAtLeast(version, 1, 2) ? MLR_SAMPLE_RATE_CURRENT : MLR_SAMPLE_RATE_LEGACY;
+}
+function getCardSampleRate() {
+  return cardSampleRate;
+}
 /** Recording target rate follows the selected varispeed directly. */
 function recTargetRate(speed) {
-  return 48000 * speed.ratio;
+  return getCardSampleRate() * speed.ratio;
 }
 
 // ---- IMA-ADPCM encoder (matches firmware adpcm.h) ----
@@ -678,6 +696,11 @@ async function cmdInfo(options = {}) {
     firmwareVersion = headerParts[firmwareTokenIndex + 1];
   }
   updateFirmwareVersionLabel();
+  const newSampleRate = sampleRateForFirmware(firmwareVersion);
+  if (newSampleRate !== cardSampleRate) {
+    cardSampleRate = newSampleRate;
+    updateUIForDeviceMode();
+  }
 
   const tracks = [];
   let sawEnd = false;
@@ -1497,9 +1520,9 @@ async function writePreparedTrack(t, prepared) {
     drawWaveform(t);
   }
 
-  const dur = (encoded.sampleCount / (48000 * speed.ratio)).toFixed(2);
+  const dur = (encoded.sampleCount / recTargetRate(speed)).toFixed(2);
   document.getElementById(`info-${t}`).textContent =
-    `${encoded.sampleCount} samples (${(encoded.sampleCount / 48000).toFixed(2)}s at 1x), ${encoded.adpcmBytes.length} bytes, rec ${speedShiftToLabel(speed.shift)}, ch ${recordedChannel + 1}, cv ${cv1PitchEnabled ? 'on' : 'off'}`;
+    `${encoded.sampleCount} samples (${(encoded.sampleCount / getCardSampleRate()).toFixed(2)}s at 1x), ${encoded.adpcmBytes.length} bytes, rec ${speedShiftToLabel(speed.shift)}, ch ${recordedChannel + 1}, cv ${cv1PitchEnabled ? 'on' : 'off'}`;
   setTimeout(() => { pbar.style.width = '0%'; }, 2000);
   return { dur, encoded };
 }
@@ -1754,7 +1777,7 @@ async function refreshInfo(options = {}) {
         if (cvSel) cvSel.checked = trackState[t.index].cv1PitchEnabled;
       }
       if (t.sampleCount > 0) {
-        const dur = (t.sampleCount / 48000).toFixed(2);
+        const dur = (t.sampleCount / getCardSampleRate()).toFixed(2);
         const spd = speedShiftToLabel(t.recordSpeedShift);
         const ch = trackState[t.index] ? getRecordedChannel(t.index) : (t.recordedChannel || 0);
         const cv = t.cv1PitchEnabled === false ? 'off' : 'on';
@@ -1785,7 +1808,7 @@ function decodeTrackBlob(data) {
   if (sampleCount === 0) return null;
 
   const adpcmData = data.slice(MLR_HEADER_SIZE, MLR_HEADER_SIZE + adpcmBytes);
-  const storedSampleRate = Math.max(3000, Math.round(48000 * speedShiftToRatio(recordSpeedShift)));
+  const storedSampleRate = Math.max(3000, Math.round(getCardSampleRate() * speedShiftToRatio(recordSpeedShift)));
 
   let predictor = 0, stepIndex = 0;
   const pcm = new Float32Array(sampleCount);

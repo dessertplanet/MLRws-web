@@ -49,12 +49,14 @@ function speedShiftToIdx(shift) {
 }
 /**
  * Card audio sample rate. Firmware 1.2.0 and later runs at 24 kHz; earlier
- * firmware runs at 48 kHz. Until a card reports its version, assume current
- * firmware; after a disconnect, keep the last connected card's rate.
+ * firmware runs at 48 kHz. Until a card reports its version, assume 48 kHz:
+ * its shorter max lengths are safe either way, since connecting a 24 kHz card
+ * only raises the limit and never trims a crop. After a disconnect, keep the
+ * last connected card's rate.
  */
 const MLR_SAMPLE_RATE_LEGACY = 48000;
 const MLR_SAMPLE_RATE_CURRENT = 24000;
-let cardSampleRate = MLR_SAMPLE_RATE_CURRENT;
+let cardSampleRate = MLR_SAMPLE_RATE_LEGACY;
 function firmwareAtLeast(version, major, minor) {
   const [maj = 0, min = 0] = String(version).split('.').map((n) => parseInt(n, 10) || 0);
   return maj > major || (maj === major && min >= minor);
@@ -64,6 +66,15 @@ function sampleRateForFirmware(version) {
 }
 function getCardSampleRate() {
   return cardSampleRate;
+}
+/**
+ * Track header byte 18 (rate_mark). Firmware 1.2.0+ marks 24 kHz tracks with
+ * 0x80; anything else (0..2, the old pan_class byte) is 48 kHz audio from
+ * earlier firmware, which 1.2.0 converts at boot.
+ */
+const MLR_RATE_MARK_24K = 0x80;
+function sampleRateForMark(rateMark) {
+  return rateMark === MLR_RATE_MARK_24K ? MLR_SAMPLE_RATE_CURRENT : MLR_SAMPLE_RATE_LEGACY;
 }
 /** Recording target rate follows the selected varispeed directly. */
 function recTargetRate(speed) {
@@ -139,7 +150,7 @@ function buildTrackBlob(encoded, recordSpeedShift = 0, recordedChannel = 0, cv1P
   hdr.setUint32(12, keyframes.length, true);
   hdr.setInt8(16, recordSpeedShift);
   hdr.setUint8(17, recordedChannel & 0x01);
-  hdr.setUint8(18, 0);
+  hdr.setUint8(18, getCardSampleRate() === MLR_SAMPLE_RATE_CURRENT ? MLR_RATE_MARK_24K : 0);
   hdr.setUint8(19, cv1PitchEnabled ? 0 : 1);
 
   for (let i = 0; i < keyframes.length && i < MLR_MAX_KEYFRAMES; i++) {
@@ -723,6 +734,7 @@ async function cmdInfo(options = {}) {
       recordSpeedShift: parts.length > 4 ? parseInt(parts[4], 10) : 0,
       recordedChannel: parts.length > 5 ? (parseInt(parts[5], 10) & 0x01) : null,
       cv1PitchEnabled: parts.length > 6 ? (parseInt(parts[6], 10) !== 0) : true,
+      rateMark: parts.length > 7 ? parseInt(parts[7], 10) : null,
     });
   }
 
@@ -1777,7 +1789,8 @@ async function refreshInfo(options = {}) {
         if (cvSel) cvSel.checked = trackState[t.index].cv1PitchEnabled;
       }
       if (t.sampleCount > 0) {
-        const dur = (t.sampleCount / getCardSampleRate()).toFixed(2);
+        const rate = t.rateMark !== null ? sampleRateForMark(t.rateMark) : getCardSampleRate();
+        const dur = (t.sampleCount / rate).toFixed(2);
         const spd = speedShiftToLabel(t.recordSpeedShift);
         const ch = trackState[t.index] ? getRecordedChannel(t.index) : (t.recordedChannel || 0);
         const cv = t.cv1PitchEnabled === false ? 'off' : 'on';
@@ -1804,11 +1817,12 @@ function decodeTrackBlob(data) {
   const adpcmBytes = dv.getUint32(8, true);
   const recordSpeedShift = dv.getInt8(16);
   const recordedChannel = dv.getUint8(17) & 0x01;
+  const rateMark = dv.getUint8(18);
   const cv1PitchEnabled = dv.getUint8(19) !== 1;
   if (sampleCount === 0) return null;
 
   const adpcmData = data.slice(MLR_HEADER_SIZE, MLR_HEADER_SIZE + adpcmBytes);
-  const storedSampleRate = Math.max(3000, Math.round(getCardSampleRate() * speedShiftToRatio(recordSpeedShift)));
+  const storedSampleRate = Math.max(3000, Math.round(sampleRateForMark(rateMark) * speedShiftToRatio(recordSpeedShift)));
 
   let predictor = 0, stepIndex = 0;
   const pcm = new Float32Array(sampleCount);

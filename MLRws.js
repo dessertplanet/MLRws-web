@@ -242,6 +242,40 @@ let isManualDisconnect = false;
 let reconnectInProgress = false;
 let firmwareVersion = null;
 let cardRotRange = null;  /* CV In 2 rotation range (%) reported by firmware 1.2.1+, else null */
+let cardCv2Mode = null;   /* CV In 2 target: 1 = filter cutoff, 0 = rotation; null if not reported */
+let cardCvTargets = null; /* [CV In 1, CV In 2] track: 0 = last touched, 1..6 = that track; null if not reported */
+let cardHasPan = false;   /* firmware reports per-track pan + filter: show those instead of channel */
+
+/* Per-track pan (-6 hard Out 1 .. +6 hard Out 2) and low-pass slot (4 = open). */
+const MLR_PAN_STEPS = 6;
+const MLR_LPF_OPEN = 4;
+const LPF_LABELS = ['250 Hz', '600 Hz', '1.5 kHz', '4 kHz', 'open'];
+/* Firmware TPT one-pole coefficients G (Q15) at the card's 24 kHz rate. */
+const LPF_COEF_Q15 = [1062, 2441, 5539, 12165, 32768];
+
+function panLabel(pan) {
+  return pan === 0 ? 'C' : (pan < 0 ? `L${-pan}` : `R${pan}`);
+}
+
+/* The card's ladder low-pass as an IIR filter at sample rate fs: four TPT
+ * one-poles H1 = G(1+z^-1)/(1+(2G-1)z^-1) in a k = 1 loop, x2 makeup, so
+ * H = 2 H1^4 / (1 + H1^4). The tanh drive is left out. Returns null when the
+ * slot is open (or the cutoff is past Nyquist at fs). */
+function ladderIIRCoefficients(slot, fs) {
+  const G24 = LPF_COEF_Q15[slot] / 32768;
+  if (slot >= MLR_LPF_OPEN || G24 >= 1) return null;
+  const fc = Math.atan(G24 / (1 - G24)) * MLR_SAMPLE_RATE_CURRENT / Math.PI;
+  if (fc >= 0.49 * fs) return null;
+  const g = Math.tan(Math.PI * fc / fs);
+  const G = g / (1 + g);
+  const a = 2 * G - 1, G4 = G ** 4;
+  const n = [1, 4, 6, 4, 1];
+  const d = [1, 4 * a, 6 * a ** 2, 4 * a ** 3, a ** 4];
+  return {
+    feedforward: n.map(c => 2 * G4 * c),
+    feedback: d.map((c, i) => c + G4 * n[i]),
+  };
+}
 const reconnectDelayMs = 900;
 const READ_CHUNK_SIZE = 1024;
 const READ_CHUNK_ACK = 0x41; // 'A'
@@ -354,6 +388,10 @@ async function serialDisconnect(showStatusMessage = true) {
   readBuffer = new Uint8Array(0);
   firmwareVersion = null;
   cardRotRange = null;
+  cardCv2Mode = null;
+  cardCvTargets = null;
+  cardHasPan = false;
+  updateTrackControlsMode();
   notifyReadBufferWaiters();
   updateFirmwareVersionLabel();
   updateCardSettingsUI();
@@ -711,6 +749,16 @@ async function cmdInfo(options = {}) {
   }
   const rotTokenIndex = headerParts.indexOf('ROT');
   cardRotRange = rotTokenIndex >= 0 ? parseInt(headerParts[rotTokenIndex + 1], 10) || null : null;
+  const cv2TokenIndex = headerParts.indexOf('CV2');
+  const cv2Token = cv2TokenIndex >= 0 ? headerParts[cv2TokenIndex + 1] : null;
+  cardCv2Mode = cv2Token === 'LPF' ? 1 : (cv2Token === 'ROT' ? 0 : null);
+  const cvTargetToken = (name) => {
+    const i = headerParts.indexOf(name);
+    const v = i >= 0 ? parseInt(headerParts[i + 1], 10) : NaN;
+    return v >= 0 && v <= 6 ? v : null;
+  };
+  const cv1Target = cvTargetToken('CV1T'), cv2Target = cvTargetToken('CV2T');
+  cardCvTargets = cv1Target !== null && cv2Target !== null ? [cv1Target, cv2Target] : null;
   updateFirmwareVersionLabel();
   updateCardSettingsUI();
   const newSampleRate = sampleRateForFirmware(firmwareVersion);
@@ -741,6 +789,8 @@ async function cmdInfo(options = {}) {
       recordedChannel: parts.length > 5 ? (parseInt(parts[5], 10) & 0x01) : null,
       cv1PitchEnabled: parts.length > 6 ? (parseInt(parts[6], 10) !== 0) : true,
       rateMark: parts.length > 7 ? parseInt(parts[7], 10) : null,
+      pan: parts.length > 9 ? Math.max(-MLR_PAN_STEPS, Math.min(MLR_PAN_STEPS, parseInt(parts[8], 10) || 0)) : null,
+      lpfSlot: parts.length > 9 ? Math.max(0, Math.min(MLR_LPF_OPEN, parseInt(parts[9], 10) || 0)) : null,
     });
   }
 
@@ -749,6 +799,17 @@ async function cmdInfo(options = {}) {
   }
 
   deviceTrackInfo = tracks;
+  const hadPan = cardHasPan;
+  cardHasPan = tracks.length > 0 && tracks.every(t => t.pan !== null);
+  if (cardHasPan) {
+    for (const t of tracks) {
+      const st = trackState[t.index];
+      if (!st) continue;
+      st.pan = t.pan;
+      st.lpfSlot = t.lpfSlot;
+    }
+  }
+  updateTrackControlsMode(hadPan !== cardHasPan);
   return tracks;
 }
 
@@ -757,6 +818,33 @@ async function cmdErase(track) {
   await serialWrite(new Uint8Array([0x45, track])); // 'E' + track
   const resp = await waitForLine();
   if (resp !== 'OK') throw new Error('Erase failed: ' + resp);
+}
+
+/** 'N' + track + (0x80 | pan + 6): track pan; 'L' + track + (0x80 | slot): low-pass. */
+async function cmdSetTrackValue(cmd, track, value, what) {
+  await cmdSync();
+  await serialWrite(new Uint8Array([cmd, track, 0x80 | value]));
+  const resp = await waitForLine();
+  if (resp !== 'OK') throw new Error(`${what} update failed: ` + resp);
+}
+const cmdSetTrackPan = (track, pan) => cmdSetTrackValue(0x4E, track, pan + MLR_PAN_STEPS, 'Pan');
+const cmdSetTrackLpf = (track, slot) => cmdSetTrackValue(0x4C, track, slot, 'Filter');
+
+/* Retry like the card settings: resending a pan/filter value is harmless. */
+async function syncTrackSetting(fn, label) {
+  let lastError = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await fn();
+      return;
+    } catch (err) {
+      lastError = err;
+      console.warn(`${label} attempt ${attempt + 1}/5 failed:`, err);
+      readBuffer = new Uint8Array(0);
+      if (attempt < 4) await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  throw lastError || new Error(`${label} failed`);
 }
 
 async function cmdSetCv1Pitch(track, enabled) {
@@ -783,6 +871,79 @@ function updateCardSettingsUI() {
     document.getElementById('rot-range').value = cardRotRange;
     document.getElementById('rot-range-val').textContent = `${cardRotRange}%`;
   }
+  /* Firmware without the CV2 token only does rotation: hide the selector. */
+  const modeSel = document.getElementById('cv2-mode');
+  modeSel.hidden = cardCv2Mode === null;
+  if (cardCv2Mode !== null) modeSel.value = String(cardCv2Mode);
+  const rotationActive = cardCv2Mode === null || cardCv2Mode === 0;
+  document.getElementById('rot-controls').hidden = !rotationActive;
+  document.querySelector('label[for="cv2-mode"]').textContent = cardCv2Mode === null ? 'CV In 2 rotation' : 'CV In 2';
+  /* Firmware without CV targets always uses the last-touched track. */
+  const hasTargets = cardCvTargets !== null;
+  document.getElementById('cv1-row').hidden = !hasTargets;
+  document.getElementById('cv2-target-wrap').hidden = !hasTargets;
+  if (hasTargets) {
+    document.getElementById('cv1-target').value = String(cardCvTargets[0]);
+    document.getElementById('cv2-target').value = String(cardCvTargets[1]);
+  }
+}
+
+/** 'C' + (0x80 | input << 3 | target): which track CV In 1 (input 0) or
+ *  CV In 2 (input 1) acts on; target 0 = last touched, 1..6 = that track. */
+async function cmdSetCvTarget(input, target) {
+  await cmdSync();
+  await serialWrite(new Uint8Array([0x43, 0x80 | (input << 3) | target]));
+  const resp = await waitForLine();
+  if (resp !== 'OK') throw new Error('CV target update failed: ' + resp);
+}
+
+/* Same retry pattern as syncCv2Mode; resending the target is harmless. */
+async function syncCvTarget(input, target) {
+  let lastError = null;
+  setStatus(`Saving CV In ${input + 1} target...`);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await cmdSetCvTarget(input, target);
+      await refreshInfo({ quietErrors: true });
+      setStatus(`CV In ${input + 1} now acts on ${target ? 'track ' + target : 'the last touched track'} (saved when the card leaves sample-manager mode)`);
+      return;
+    } catch (err) {
+      lastError = err;
+      console.warn(`CV In ${input + 1} target sync attempt ${attempt + 1}/5 failed:`, err);
+      readBuffer = new Uint8Array(0);
+      if (attempt < 4) await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  throw lastError || new Error('CV target sync failed');
+}
+
+/** 'M' + (0x80 | mode): what CV In 2 drives (0 rotation, 1 filter cutoff). */
+async function cmdSetCv2Mode(mode) {
+  await cmdSync();
+  await serialWrite(new Uint8Array([0x4D, 0x80 | mode]));
+  const resp = await waitForLine();
+  if (resp !== 'OK') throw new Error('CV In 2 mode update failed: ' + resp);
+}
+
+/* Same pattern as syncRotRange: the follow-up info read can miss right after a
+ * command, so retry with a clean buffer. Setting the mode again is harmless. */
+async function syncCv2Mode(mode) {
+  let lastError = null;
+  setStatus('Saving CV In 2 mode...');
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await cmdSetCv2Mode(mode);
+      await refreshInfo({ quietErrors: true });
+      setStatus(`CV In 2 now drives ${mode ? 'filter cutoff' : 'rotation'} (saved when the card leaves sample-manager mode)`);
+      return;
+    } catch (err) {
+      lastError = err;
+      console.warn(`CV In 2 mode sync attempt ${attempt + 1}/5 failed:`, err);
+      readBuffer = new Uint8Array(0);
+      if (attempt < 4) await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  throw lastError || new Error('CV In 2 mode sync failed');
 }
 
 async function syncRotRange(pct) {
@@ -972,17 +1133,53 @@ function getRecordedChannel(t) {
 }
 
 function getSourceChannelIndex(st) {
-  if (!st || !st.audioBuffer) return 0;
+  if (!st || !st.audioBuffer || cardHasPan) return 0;
   return (st.recordedChannel === 1 && st.audioBuffer.numberOfChannels > 1) ? 1 : 0;
 }
 
 function selectedSourceChannelLabel(st) {
+  if (cardHasPan && st.audioBuffer && st.audioBuffer.numberOfChannels > 1) return 'source L+R';
   const sourceChannel = getSourceChannelIndex(st);
   return `source ${sourceChannel + 1}`;
 }
 
+/* With pan there's no channel to pick a side of a stereo file: use the mono
+ * sum (cached per buffer). Otherwise the recorded channel picks the side. */
 function getSelectedChannelData(st) {
-  return st.audioBuffer.getChannelData(getSourceChannelIndex(st));
+  const buf = st.audioBuffer;
+  if (cardHasPan && buf.numberOfChannels > 1) {
+    if (st.monoSumFor !== buf) {
+      const l = buf.getChannelData(0), r = buf.getChannelData(1);
+      const sum = new Float32Array(buf.length);
+      for (let i = 0; i < sum.length; i++) sum[i] = 0.5 * (l[i] + r[i]);
+      st.monoSum = sum;
+      st.monoSumFor = buf;
+    }
+    return st.monoSum;
+  }
+  return buf.getChannelData(getSourceChannelIndex(st));
+}
+
+/* Pan firmware: swap the channel select for pan + filter controls. */
+function updateTrackControlsMode(redraw = false) {
+  for (let t = 0; t < MLR_NUM_TRACKS; t++) {
+    const st = trackState[t];
+    const chWrap = document.getElementById(`channel-wrap-${t}`);
+    if (!st || !chWrap) continue;
+    chWrap.hidden = cardHasPan;
+    document.getElementById(`pan-wrap-${t}`).hidden = !cardHasPan;
+    document.getElementById(`lpf-wrap-${t}`).hidden = !cardHasPan;
+    document.getElementById(`pan-${t}`).value = String(st.pan);
+    document.getElementById(`pan-val-${t}`).textContent = panLabel(st.pan);
+    document.getElementById(`lpf-${t}`).value = String(st.lpfSlot);
+    if (redraw && st.audioBuffer) drawWaveform(t);
+  }
+}
+
+function trackRoutingLabel(t) {
+  const st = trackState[t];
+  if (cardHasPan && st) return `pan ${panLabel(st.pan)}, filter ${LPF_LABELS[st.lpfSlot]}`;
+  return `ch ${getRecordedChannel(t) + 1}`;
 }
 
 function getDeviceTrackInfo(t) {
@@ -1010,6 +1207,8 @@ function createTrackUI() {
       recordSpeedShift: 0,
       recordedChannel: 0,
       cv1PitchEnabled: false,
+      pan: -MLR_PAN_STEPS,
+      lpfSlot: MLR_LPF_OPEN,
     };
 
     const div = document.createElement('div');
@@ -1024,11 +1223,24 @@ function createTrackUI() {
         <select id="speed-${t}">
           ${SPEEDS.map((s, i) => `<option value="${i}" ${i === 3 ? 'selected' : ''}>${s.name} (${maxSecs(s)}s)</option>`).join('')}
         </select>
-        <label class="control-label">Channel:</label>
-        <select id="channel-${t}">
-          <option value="0" ${trackState[t].recordedChannel === 0 ? 'selected' : ''}>1</option>
-          <option value="1" ${trackState[t].recordedChannel === 1 ? 'selected' : ''}>2</option>
-        </select>
+        <span id="channel-wrap-${t}" class="ctl-wrap">
+          <label class="control-label">Channel:</label>
+          <select id="channel-${t}">
+            <option value="0" ${trackState[t].recordedChannel === 0 ? 'selected' : ''}>1</option>
+            <option value="1" ${trackState[t].recordedChannel === 1 ? 'selected' : ''}>2</option>
+          </select>
+        </span>
+        <span id="pan-wrap-${t}" class="ctl-wrap" hidden>
+          <label class="control-label">Pan:</label>
+          <input type="range" id="pan-${t}" class="pan-slider" min="-6" max="6" step="1" value="${trackState[t].pan}">
+          <span id="pan-val-${t}" class="pan-val">${panLabel(trackState[t].pan)}</span>
+        </span>
+        <span id="lpf-wrap-${t}" class="ctl-wrap" hidden>
+          <label class="control-label">Filter:</label>
+          <select id="lpf-${t}">
+            ${LPF_LABELS.map((l, i) => `<option value="${i}" ${i === trackState[t].lpfSlot ? 'selected' : ''}>${l}</option>`).join('')}
+          </select>
+        </span>
         <label class="control-label">CV/pulse outputs:</label>
         <input type="checkbox" id="cv1pitch-${t}" ${trackState[t].cv1PitchEnabled ? 'checked' : ''}>
         <span id="info-${t}" class="track-info">empty</span>
@@ -1081,6 +1293,37 @@ function createTrackUI() {
         drawWaveform(t);
       }
       if (previewState[t]) previewTrack(t, true);
+    });
+
+    document.getElementById(`pan-${t}`).addEventListener('input', (e) => {
+      const pan = parseInt(e.target.value, 10) || 0;
+      trackState[t].pan = pan;
+      document.getElementById(`pan-val-${t}`).textContent = panLabel(pan);
+      const ps = previewState[t];
+      if (ps && ps.panner) ps.panner.pan.setTargetAtTime(pan / MLR_PAN_STEPS, ps.actx.currentTime, 0.01);
+    });
+    document.getElementById(`pan-${t}`).addEventListener('change', async () => {
+      if (!port || !cardHasPan) return;
+      const pan = trackState[t].pan;
+      try {
+        await syncTrackSetting(() => cmdSetTrackPan(t, pan), `Track ${t + 1} pan`);
+        setStatus(`Track ${t + 1} pan ${panLabel(pan)} (saved when the card leaves sample-manager mode)`);
+      } catch (err) {
+        setStatus('Pan update error: ' + err.message);
+      }
+    });
+
+    document.getElementById(`lpf-${t}`).addEventListener('change', async (e) => {
+      const slot = Math.max(0, Math.min(MLR_LPF_OPEN, parseInt(e.target.value, 10) || 0));
+      trackState[t].lpfSlot = slot;
+      setPreviewFilter(t);
+      if (!port || !cardHasPan) return;
+      try {
+        await syncTrackSetting(() => cmdSetTrackLpf(t, slot), `Track ${t + 1} filter`);
+        setStatus(`Track ${t + 1} filter ${LPF_LABELS[slot]} (saved when the card leaves sample-manager mode)`);
+      } catch (err) {
+        setStatus('Filter update error: ' + err.message);
+      }
     });
 
     document.getElementById(`cv1pitch-${t}`).addEventListener('change', async (e) => {
@@ -1520,9 +1763,8 @@ function cropToSelection(t) {
   setStatus(`Cropped to ${newBuf.duration.toFixed(2)}s`);
 }
 
-function prepareTrackUpload(sourceBuffer, sourceChannel, speed, cropStart, cropEnd, recordedChannel, cv1PitchEnabled) {
+function prepareTrackUpload(sourceBuffer, srcData, speed, cropStart, cropEnd, recordedChannel, cv1PitchEnabled) {
   const targetRate = recTargetRate(speed);
-  const srcData = sourceBuffer.getChannelData(sourceChannel);
   const cropped = srcData.slice(cropStart, cropEnd);
   const croppedBuf = new AudioBuffer({
     length: cropped.length,
@@ -1552,6 +1794,13 @@ async function writePreparedTrack(t, prepared) {
   const pbar = document.getElementById(`pbar-${t}`);
   await cmdWrite(t, blob, (pct) => { pbar.style.width = (pct * 100) + '%'; });
   pbar.style.width = '100%';
+  if (cardHasPan) {
+    /* New audio would otherwise start hard to its channel side: send the
+     * track's pan (the card keeps it over the upload) and filter. */
+    const st = trackState[t];
+    await syncTrackSetting(() => cmdSetTrackPan(t, st.pan), `Track ${t + 1} pan`);
+    await syncTrackSetting(() => cmdSetTrackLpf(t, st.lpfSlot), `Track ${t + 1} filter`);
+  }
 
   // Update the UI from the exact blob we just wrote, instead of
   // immediately re-reading the whole track back over serial.
@@ -1578,7 +1827,7 @@ async function writePreparedTrack(t, prepared) {
 
   const dur = (encoded.sampleCount / recTargetRate(speed)).toFixed(2);
   document.getElementById(`info-${t}`).textContent =
-    `${encoded.sampleCount} samples (${(encoded.sampleCount / getCardSampleRate()).toFixed(2)}s at 1x), ${encoded.adpcmBytes.length} bytes, rec ${speedShiftToLabel(speed.shift)}, ch ${recordedChannel + 1}, cv ${cv1PitchEnabled ? 'on' : 'off'}`;
+    `${encoded.sampleCount} samples (${(encoded.sampleCount / getCardSampleRate()).toFixed(2)}s at 1x), ${encoded.adpcmBytes.length} bytes, rec ${speedShiftToLabel(speed.shift)}, ${cardHasPan ? trackRoutingLabel(t) : 'ch ' + (recordedChannel + 1)}, cv ${cv1PitchEnabled ? 'on' : 'off'}`;
   setTimeout(() => { pbar.style.width = '0%'; }, 2000);
   return { dur, encoded };
 }
@@ -1596,17 +1845,17 @@ async function uploadTrack(t) {
   try {
     // Channel 2 uses source channel 2 when present; mono files use their only
     // channel for either output channel.
-    const sourceChannel = getSourceChannelIndex(st);
+    const srcData = getSelectedChannelData(st);
     const recordedChannel = getRecordedChannel(t);
     const info = getDeviceTrackInfo(t);
     const hadContent = !!(info && info.sampleCount > 0);
     const cv1PitchEnabled = hadContent ? (st.cv1PitchEnabled === true) : false;
-    const prepared = prepareTrackUpload(st.audioBuffer, sourceChannel, speed, cropStart, cropEnd, recordedChannel, cv1PitchEnabled);
+    const prepared = prepareTrackUpload(st.audioBuffer, srcData, speed, cropStart, cropEnd, recordedChannel, cv1PitchEnabled);
     const result = await writePreparedTrack(t, prepared);
 
     // Refresh compact device metadata without blocking the UI.
     refreshInfo().catch(() => {});
-    setStatus(`Track ${t + 1} uploaded to channel ${recordedChannel + 1}: ${result.dur}s, ${result.encoded.sampleCount} samples`);
+    setStatus(`Track ${t + 1} uploaded${cardHasPan ? ` (${trackRoutingLabel(t)})` : ` to channel ${recordedChannel + 1}`}: ${result.dur}s, ${result.encoded.sampleCount} samples`);
   } catch (e) {
     setStatus('Upload error: ' + e.message);
     const pbar = document.getElementById(`pbar-${t}`);
@@ -1705,6 +1954,23 @@ function setPreviewButtonActive(t, active) {
   btn.textContent = active ? 'Stop' : 'Preview';
 }
 
+/* (Re)wire a running preview through the track's filter: src -> filter -> panner. */
+function setPreviewFilter(t) {
+  const ps = previewState[t];
+  if (!ps || !ps.panner) return;
+  const coeffs = ladderIIRCoefficients(trackState[t].lpfSlot, ps.actx.sampleRate);
+  const next = coeffs ? ps.actx.createIIRFilter(coeffs.feedforward, coeffs.feedback) : null;
+  try { ps.src.disconnect(); } catch (_) {}
+  if (ps.filter) { try { ps.filter.disconnect(); } catch (_) {} }
+  if (next) {
+    ps.src.connect(next);
+    next.connect(ps.panner);
+  } else {
+    ps.src.connect(ps.panner);
+  }
+  ps.filter = next;
+}
+
 function stopPreview(t, updateStatus = false) {
   const ps = previewState[t];
   if (!ps) return false;
@@ -1780,7 +2046,15 @@ function previewTrack(t, forceRestart = false) {
   const src = actx.createBufferSource();
   src.buffer = buf;
   src.loop = true;
-  src.connect(actx.destination);
+  let panner = null;
+  if (cardHasPan) {
+    /* Same equal-power law as the card; the filter sits between (see setPreviewFilter). */
+    panner = actx.createStereoPanner();
+    panner.pan.value = st.pan / MLR_PAN_STEPS;
+    panner.connect(actx.destination);
+  } else {
+    src.connect(actx.destination);
+  }
   src.onended = () => {
     actx.close();
     previewState[t] = null;
@@ -1791,7 +2065,8 @@ function previewTrack(t, forceRestart = false) {
   };
   const startTime = actx.currentTime;
   const duration = numFrames / targetRate;
-  previewState[t] = { src, actx, startTime, duration, track: t };
+  previewState[t] = { src, actx, startTime, duration, track: t, panner, filter: null };
+  if (panner) setPreviewFilter(t);
   setPreviewButtonActive(t, true);
   src.start();
 
@@ -1814,7 +2089,7 @@ function previewTrack(t, forceRestart = false) {
     requestAnimationFrame(animatePlayhead);
   }
   requestAnimationFrame(animatePlayhead);
-  setStatus(`Preview ch ${getRecordedChannel(t) + 1}: ${duration.toFixed(2)}s, ADPCM at ${Math.round(targetRate)}Hz (${speed.name}, rec ${speedShiftToLabel(st.recordSpeedShift ?? 0)})`);
+  setStatus(`Preview ${trackRoutingLabel(t)}: ${duration.toFixed(2)}s, ADPCM at ${Math.round(targetRate)}Hz (${speed.name}, rec ${speedShiftToLabel(st.recordSpeedShift ?? 0)})`);
 }
 
 async function refreshInfo(options = {}) {
@@ -1836,9 +2111,9 @@ async function refreshInfo(options = {}) {
         const rate = t.rateMark !== null ? sampleRateForMark(t.rateMark) : getCardSampleRate();
         const dur = (t.sampleCount / rate).toFixed(2);
         const spd = speedShiftToLabel(t.recordSpeedShift);
-        const ch = trackState[t.index] ? getRecordedChannel(t.index) : (t.recordedChannel || 0);
+        const routing = trackState[t.index] ? trackRoutingLabel(t.index) : `ch ${(t.recordedChannel || 0) + 1}`;
         const cv = t.cv1PitchEnabled === false ? 'off' : 'on';
-        el.textContent = `${t.sampleCount} samples (${dur}s at 1x), ${t.adpcmBytes} bytes, rec ${spd}, ch ${ch + 1}, cv ${cv}`;
+        el.textContent = `${t.sampleCount} samples (${dur}s at 1x), ${t.adpcmBytes} bytes, rec ${spd}, ${routing}, cv ${cv}`;
       } else {
         el.textContent = 'empty';
       }
@@ -2008,6 +2283,32 @@ try {
   setUnsupportedBrowserError(e.message);
   console.error(e);
 }
+
+for (const [input, id] of [[0, 'cv1-target'], [1, 'cv2-target']]) {
+  document.getElementById(id).addEventListener('change', async (e) => {
+    const target = Math.max(0, Math.min(6, parseInt(e.target.value, 10) || 0));
+    if (!port || cardCvTargets === null) return;
+    try {
+      await syncCvTarget(input, target);
+    } catch (err) {
+      setStatus(`CV In ${input + 1} target error: ` + err.message);
+      /* the card may have switched even if confirming it failed: re-read */
+      try { await refreshInfo({ quietErrors: true }); } catch (_) { updateCardSettingsUI(); }
+    }
+  });
+}
+
+document.getElementById('cv2-mode').addEventListener('change', async (e) => {
+  const mode = parseInt(e.target.value, 10) === 0 ? 0 : 1;
+  if (!port || cardCv2Mode === null) return;
+  try {
+    await syncCv2Mode(mode);
+  } catch (err) {
+    setStatus('CV In 2 mode error: ' + err.message);
+    /* the card may have switched even if confirming it failed: re-read */
+    try { await refreshInfo({ quietErrors: true }); } catch (_) { updateCardSettingsUI(); }
+  }
+});
 
 document.getElementById('rot-range').addEventListener('input', (e) => {
   document.getElementById('rot-range-val').textContent = `${e.target.value}%`;

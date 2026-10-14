@@ -35,8 +35,10 @@ h1 { margin-bottom: 10px; }
 #card-settings .cv-row { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
 #card-settings .cv-row[hidden], #card-settings .cv-target[hidden] { display: none; }
 #card-settings .cv-row > label:first-child { min-width: 60px; }
+#card-settings .cv-target { display: inline-flex; align-items: center; gap: 5px; }
+#card-settings .cv-box { display: inline-flex; align-items: center; gap: 2px; font-size: 12px; }
 #card-settings[hidden] { display: none; }
-#card-settings input[type=range] { width: 160px; min-width: 60px; flex: 0 1 auto; }
+#card-settings input[type=range] { width: 110px; min-width: 60px; flex: 0 1 auto; }
 #card-settings select { font-family: monospace; }
 #rot-controls { display: flex; align-items: center; gap: 10px; min-width: 0; }
 #rot-controls[hidden] { display: none; }
@@ -51,18 +53,16 @@ h1 { margin-bottom: 10px; }
 <div id="status">Not connected</div>
 <div id="card-settings" hidden>
   <div class="cv-row" id="cv1-row" hidden>
-    <label for="cv1-target">CV In 1</label>
+    <label>CV In 1</label>
     <span>Pan offset</span>
-    <span class="cv-target">on
-      <select id="cv1-target">
-      <option value="0">last touched track</option>
-      <option value="1">track 1</option>
-      <option value="2">track 2</option>
-      <option value="3">track 3</option>
-      <option value="4">track 4</option>
-      <option value="5">track 5</option>
-      <option value="6">track 6</option>
-      </select>
+    <span class="cv-target" id="cv1-targets">on
+      <label class="cv-box"><input type="checkbox" data-cv="0" data-track="0">last touched</label>
+      <label class="cv-box"><input type="checkbox" data-cv="0" data-track="1">1</label>
+      <label class="cv-box"><input type="checkbox" data-cv="0" data-track="2">2</label>
+      <label class="cv-box"><input type="checkbox" data-cv="0" data-track="3">3</label>
+      <label class="cv-box"><input type="checkbox" data-cv="0" data-track="4">4</label>
+      <label class="cv-box"><input type="checkbox" data-cv="0" data-track="5">5</label>
+      <label class="cv-box"><input type="checkbox" data-cv="0" data-track="6">6</label>
     </span>
   </div>
   <div class="cv-row">
@@ -72,15 +72,13 @@ h1 { margin-bottom: 10px; }
       <option value="0">Rotation</option>
     </select>
     <span class="cv-target" id="cv2-target-wrap" hidden>on
-      <select id="cv2-target">
-      <option value="0">last touched track</option>
-      <option value="1">track 1</option>
-      <option value="2">track 2</option>
-      <option value="3">track 3</option>
-      <option value="4">track 4</option>
-      <option value="5">track 5</option>
-      <option value="6">track 6</option>
-      </select>
+        <label class="cv-box"><input type="checkbox" data-cv="1" data-track="0">last touched</label>
+        <label class="cv-box"><input type="checkbox" data-cv="1" data-track="1">1</label>
+        <label class="cv-box"><input type="checkbox" data-cv="1" data-track="2">2</label>
+        <label class="cv-box"><input type="checkbox" data-cv="1" data-track="3">3</label>
+        <label class="cv-box"><input type="checkbox" data-cv="1" data-track="4">4</label>
+        <label class="cv-box"><input type="checkbox" data-cv="1" data-track="5">5</label>
+        <label class="cv-box"><input type="checkbox" data-cv="1" data-track="6">6</label>
     </span>
     <span id="rot-controls" hidden>
       <label for="rot-range">range</label>
@@ -92,6 +90,6 @@ h1 { margin-bottom: 10px; }
 <div id="tracks"></div>
 <div id="firmware-version">Firmware: --</div>
 
-<script src="MLRws.js?v=1.2.1-3"></script>
+<script src="MLRws.js?v=1.2.1-4"></script>
 </body>
 </html>

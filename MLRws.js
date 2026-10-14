@@ -243,7 +243,7 @@ let reconnectInProgress = false;
 let firmwareVersion = null;
 let cardRotRange = null;  /* CV In 2 rotation range (%) reported by firmware 1.2.1+, else null */
 let cardCv2Mode = null;   /* CV In 2 target: 1 = filter cutoff, 0 = rotation; null if not reported */
-let cardCvTargets = null; /* [CV In 1, CV In 2] track: 0 = last touched, 1..6 = that track; null if not reported */
+let cardCvTargets = null; /* [CV In 1, CV In 2] track masks (bit t = track t+1, 0 = last touched); null if not reported */
 let cardHasPan = false;   /* firmware reports per-track pan + filter: show those instead of channel */
 
 /* Per-track pan (-6 hard Out 1 .. +6 hard Out 2) and low-pass slot (4 = open). */
@@ -755,12 +755,14 @@ async function cmdInfo(options = {}) {
   const cv2TokenIndex = headerParts.indexOf('CV2');
   const cv2Token = cv2TokenIndex >= 0 ? headerParts[cv2TokenIndex + 1] : null;
   cardCv2Mode = cv2Token === 'LPF' ? 1 : (cv2Token === 'ROT' ? 0 : null);
+  /* CV1M/CV2M: track masks. (Earlier 1.2.1 builds sent CV1T/CV2T with one
+   * track in a different command format, so those get no target UI.) */
   const cvTargetToken = (name) => {
     const i = headerParts.indexOf(name);
     const v = i >= 0 ? parseInt(headerParts[i + 1], 10) : NaN;
-    return v >= 0 && v <= 6 ? v : null;
+    return v >= 0 && v <= 63 ? v : null;
   };
-  const cv1Target = cvTargetToken('CV1T'), cv2Target = cvTargetToken('CV2T');
+  const cv1Target = cvTargetToken('CV1M'), cv2Target = cvTargetToken('CV2M');
   cardCvTargets = cv1Target !== null && cv2Target !== null ? [cv1Target, cv2Target] : null;
   updateFirmwareVersionLabel();
   updateCardSettingsUI();
@@ -886,16 +888,35 @@ function updateCardSettingsUI() {
   document.getElementById('cv1-row').hidden = !hasTargets;
   document.getElementById('cv2-target-wrap').hidden = !hasTargets;
   if (hasTargets) {
-    document.getElementById('cv1-target').value = String(cardCvTargets[0]);
-    document.getElementById('cv2-target').value = String(cardCvTargets[1]);
+    renderCvTargetBoxes(0, cardCvTargets[0]);
+    renderCvTargetBoxes(1, cardCvTargets[1]);
   }
 }
 
-/** 'C' + (0x80 | input << 3 | target): which track CV In 1 (input 0) or
- *  CV In 2 (input 1) acts on; target 0 = last touched, 1..6 = that track. */
-async function cmdSetCvTarget(input, target) {
+function cvTargetBoxes(input) {
+  return [...document.querySelectorAll(`input[data-cv="${input}"]`)];
+}
+
+/* "last touched" is checked exactly when no track is. */
+function renderCvTargetBoxes(input, mask) {
+  for (const box of cvTargetBoxes(input)) {
+    const t = parseInt(box.dataset.track, 10);
+    box.checked = t === 0 ? mask === 0 : !!(mask & (1 << (t - 1)));
+  }
+}
+
+function cvTargetLabel(mask) {
+  if (!mask) return 'the last touched track';
+  const tracks = [];
+  for (let t = 0; t < MLR_NUM_TRACKS; t++) if (mask & (1 << t)) tracks.push(t + 1);
+  return (tracks.length === 1 ? 'track ' : 'tracks ') + tracks.join(', ');
+}
+
+/** 'C' + (0x80 | input << 6 | mask): which tracks CV In 1 (input 0) or
+ *  CV In 2 (input 1) act on; mask bit t = track t+1, 0 = last touched. */
+async function cmdSetCvTarget(input, mask) {
   await cmdSync();
-  await serialWrite(new Uint8Array([0x43, 0x80 | (input << 3) | target]));
+  await serialWrite(new Uint8Array([0x43, 0x80 | (input << 6) | (mask & 0x3F)]));
   const resp = await waitForLine();
   if (resp !== 'OK') throw new Error('CV target update failed: ' + resp);
 }
@@ -908,7 +929,7 @@ async function syncCvTarget(input, target) {
     try {
       await cmdSetCvTarget(input, target);
       await refreshInfo({ quietErrors: true });
-      setStatus(`CV In ${input + 1} now acts on ${target ? 'track ' + target : 'the last touched track'} (saved when the card leaves sample-manager mode)`);
+      setStatus(`CV In ${input + 1} now acts on ${cvTargetLabel(target)} (saved when the card leaves sample-manager mode)`);
       return;
     } catch (err) {
       lastError = err;
@@ -2287,18 +2308,37 @@ try {
   console.error(e);
 }
 
-for (const [input, id] of [[0, 'cv1-target'], [1, 'cv2-target']]) {
-  document.getElementById(id).addEventListener('change', async (e) => {
-    const target = Math.max(0, Math.min(6, parseInt(e.target.value, 10) || 0));
-    if (!port || cardCvTargets === null) return;
-    try {
-      await syncCvTarget(input, target);
-    } catch (err) {
-      setStatus(`CV In ${input + 1} target error: ` + err.message);
-      /* the card may have switched even if confirming it failed: re-read */
-      try { await refreshInfo({ quietErrors: true }); } catch (_) { updateCardSettingsUI(); }
-    }
-  });
+/* Checkbox clicks settle for a moment, then the whole set goes to the card;
+ * sends queue one after another so quick clicks never overlap on the port. */
+const cvTargetTimers = [null, null];
+let cvTargetQueue = Promise.resolve();
+for (const input of [0, 1]) {
+  for (const box of cvTargetBoxes(input)) {
+    box.addEventListener('change', () => {
+      const t = parseInt(box.dataset.track, 10);
+      let mask = 0;
+      if (t !== 0) {
+        for (const b of cvTargetBoxes(input)) {
+          const bt = parseInt(b.dataset.track, 10);
+          if (bt && b.checked) mask |= 1 << (bt - 1);
+        }
+      }
+      renderCvTargetBoxes(input, mask);  /* "last touched" clears the tracks; no tracks = last touched */
+      if (!port || cardCvTargets === null) return;
+      clearTimeout(cvTargetTimers[input]);
+      cvTargetTimers[input] = setTimeout(() => {
+        cvTargetQueue = cvTargetQueue.then(async () => {
+          try {
+            await syncCvTarget(input, mask);
+          } catch (err) {
+            setStatus(`CV In ${input + 1} target error: ` + err.message);
+            /* the card may have switched even if confirming it failed: re-read */
+            try { await refreshInfo({ quietErrors: true }); } catch (_) { updateCardSettingsUI(); }
+          }
+        });
+      }, 400);
+    });
+  }
 }
 
 document.getElementById('cv2-mode').addEventListener('change', async (e) => {

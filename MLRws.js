@@ -2304,6 +2304,8 @@ for (const [input, id] of [[0, 'cv1-target'], [1, 'cv2-target']]) {
 document.getElementById('cv2-mode').addEventListener('change', async (e) => {
   const mode = parseInt(e.target.value, 10) === 0 ? 0 : 1;
   if (!port || cardCv2Mode === null) return;
+  /* Show the chosen mode's controls straight away; a failure re-reads the card. */
+  document.getElementById('rot-controls').hidden = mode !== 0;
   try {
     await syncCv2Mode(mode);
   } catch (err) {

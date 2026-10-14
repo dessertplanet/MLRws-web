@@ -12,10 +12,14 @@ h1 { margin-bottom: 10px; }
 #status.error { border-color: #b00020; color: #b00020; }
 .track { border: 1px solid #ccc; margin: 8px 0; padding: 10px; }
 .track.drag-over { border-color: #1f6feb; background: rgba(31,111,235,0.06); }
-.track-header { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.track-header { display: flex; align-items: center; gap: 4px 10px; flex-wrap: wrap; margin-bottom: 8px; }
 .track-header label { font-weight: bold; min-width: 60px; }
 .track-header .control-label { font-size: 11px; margin-left: 8px; min-width: auto; }
 .track-header select { font-family: monospace; }
+.track-header .ctl-wrap { display: inline-flex; align-items: center; gap: 6px; }
+.track-header .ctl-wrap[hidden] { display: none; }
+.track-header .pan-slider { width: 70px; }
+.track-header .pan-val { font-size: 11px; min-width: 22px; }
 .track-info { font-size: 12px; color: #666; margin-left: auto; text-align: right; }
 .track-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 .track-actions button { font-family: monospace; font-size: 12px; padding: 4px 10px; cursor: pointer; }
@@ -27,10 +31,15 @@ h1 { margin-bottom: 10px; }
 .playhead { position: absolute; top: 0; width: 2px; height: 100%; background: #00cc00; pointer-events: none; display: none; }
 #connect-btn { font-family: monospace; font-size: 14px; padding: 6px 16px; cursor: pointer; margin-bottom: 10px; }
 #connect-btn:disabled { cursor: not-allowed; opacity: 0.55; }
-#card-settings { margin: 10px 0; padding: 8px; border: 1px solid #ccc; display: flex; align-items: center; gap: 10px; }
+#card-settings { margin: 10px 0; padding: 8px; border: 1px solid #ccc; display: flex; flex-direction: column; gap: 6px; }
+#card-settings .cv-row { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+#card-settings .cv-row[hidden], #card-settings .cv-target[hidden] { display: none; }
+#card-settings .cv-row > label:first-child { min-width: 60px; }
 #card-settings[hidden] { display: none; }
-#card-settings input[type=range] { flex: 1; max-width: 300px; }
-#card-settings .hint { font-size: 11px; color: #666; }
+#card-settings input[type=range] { width: 160px; min-width: 60px; flex: 0 1 auto; }
+#card-settings select { font-family: monospace; }
+#rot-controls { display: flex; align-items: center; gap: 10px; min-width: 0; }
+#rot-controls[hidden] { display: none; }
 #firmware-version { position: fixed; right: 12px; bottom: 10px; color: #666; font-size: 12px; background: rgba(255,255,255,0.88); padding: 3px 6px; pointer-events: none; }
 .progress { height: 4px; background: #eee; margin-top: 4px; }
 .progress-bar { height: 100%; background: #333; width: 0%; transition: width 0.1s; }
@@ -41,10 +50,44 @@ h1 { margin-bottom: 10px; }
 <button id="connect-btn">Connect</button>
 <div id="status">Not connected</div>
 <div id="card-settings" hidden>
-  <label for="rot-range">CV In 2 rotation range</label>
-  <input type="range" id="rot-range" min="1" max="100" value="100">
-  <span id="rot-range-val">100%</span>
-  <span class="hint">share of the track +5 V rotates by</span>
+  <div class="cv-row" id="cv1-row" hidden>
+    <label for="cv1-target">CV In 1</label>
+    <span>Pan offset</span>
+    <span class="cv-target">on
+      <select id="cv1-target">
+      <option value="0">last touched track</option>
+      <option value="1">track 1</option>
+      <option value="2">track 2</option>
+      <option value="3">track 3</option>
+      <option value="4">track 4</option>
+      <option value="5">track 5</option>
+      <option value="6">track 6</option>
+      </select>
+    </span>
+  </div>
+  <div class="cv-row">
+    <label for="cv2-mode">CV In 2</label>
+    <select id="cv2-mode">
+      <option value="1">Filter cutoff</option>
+      <option value="0">Rotation</option>
+    </select>
+    <span class="cv-target" id="cv2-target-wrap" hidden>on
+      <select id="cv2-target">
+      <option value="0">last touched track</option>
+      <option value="1">track 1</option>
+      <option value="2">track 2</option>
+      <option value="3">track 3</option>
+      <option value="4">track 4</option>
+      <option value="5">track 5</option>
+      <option value="6">track 6</option>
+      </select>
+    </span>
+    <span id="rot-controls" hidden>
+      <label for="rot-range">range</label>
+      <input type="range" id="rot-range" min="1" max="100" value="100">
+      <span id="rot-range-val">100%</span>
+    </span>
+  </div>
 </div>
 <div id="tracks"></div>
 <div id="firmware-version">Firmware: --</div>

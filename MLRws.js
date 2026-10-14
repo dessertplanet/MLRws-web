@@ -287,8 +287,11 @@ function notifyReadBufferWaiters() {
   for (const resolve of waiters) resolve();
 }
 
+/* Wait for the next chunk from the read loop. Always waits, even if the buffer
+ * already holds bytes: callers loop until they have what they need, and
+ * returning early on a partial reply spins without yielding, which starves
+ * the read loop until the caller times out. */
 async function waitForIncomingData(timeoutMs = 10000) {
-  if (readBuffer.length > 0) return;
   if (!port || !reader) throw new Error('Disconnected');
 
   await new Promise((resolve, reject) => {
